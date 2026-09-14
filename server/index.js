@@ -172,6 +172,14 @@ async function initDb() {
       reason      TEXT DEFAULT 'offline',
       archived_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS listing_changes (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      listing_id INTEGER NOT NULL,
+      field      TEXT NOT NULL,
+      old_value  TEXT,
+      new_value  TEXT,
+      changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   // Migrations
@@ -450,17 +458,23 @@ app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
 // ── Push sender helper ─────────────────────────────────────
 async function sendPushToUser(userId, payload) {
   const subs = dbAll('SELECT * FROM push_subscriptions WHERE user_id=?', [userId]);
+  if (!subs.length) {
+    console.log(`[Push] Nutzer ${userId} hat keine aktive Browser-Push-Subscription (nie aktiviert oder abgelaufen)`);
+    return;
+  }
   for (const sub of subs) {
     try {
       await webpush.sendNotification(
         { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
         JSON.stringify(payload)
       );
+      console.log(`[Push] Gesendet an Nutzer ${userId}`);
     } catch (e) {
       if (e.statusCode === 410 || e.statusCode === 404) {
         // Subscription expired – remove it
         dbRun('DELETE FROM push_subscriptions WHERE id=?', [sub.id]);
         saveDb();
+        console.warn(`[Push] Subscription für Nutzer ${userId} abgelaufen (HTTP ${e.statusCode}), entfernt`);
       } else {
         console.warn(`[Push] Fehler für user ${userId}:`, e.message);
       }
@@ -571,6 +585,17 @@ app.get('/api/listings/mine', requireAuth, (req, res) => {
   res.json({ listings });
 });
 
+// Change history for a listing (title/price/size/rooms edits detected by
+// the periodic re-check), shown in the detail view so it's clear whether
+// e.g. the price shown today is the one you originally liked.
+app.get('/api/listings/:id/changes', requireAuth, (req, res) => {
+  const changes = dbAll(
+    'SELECT field, old_value, new_value, changed_at FROM listing_changes WHERE listing_id=? ORDER BY changed_at DESC',
+    [req.params.id]
+  );
+  res.json({ changes });
+});
+
 // Change visibility of a manually-added listing (only the original adder may do this,
 // and only for listings that weren't found by a search agent).
 app.patch('/api/listings/:id/visibility', requireAuth, (req, res) => {
@@ -658,8 +683,57 @@ app.get('/api/listings/swipe', requireAuth, (req, res) => {
             ))
       ))
     )
-    ORDER BY (CASE WHEN sw.action = 'skip' THEN 1 ELSE 0 END), l.added_at DESC
   `, [uid, uid, uid, uid, uid, uid]);
+
+  // ── Group-priority sort ──────────────────────────────────
+  // Bring listings other group members already reacted to towards the
+  // front, so a "does anyone else like this?" signal surfaces early:
+  //   0) superliked by another group member
+  //   1) liked by another group member
+  //   2) no group signal yet (default) — newest first
+  //   3) disliked by another group member (deprioritized, but not hidden —
+  //      you might still disagree with your groupmates)
+  // Users with no groups simply get tier 2 for everything, which reduces
+  // to the previous "newest first" behaviour unchanged.
+  const otherMemberIds = dbAll(`
+    SELECT DISTINCT gm2.user_id FROM group_members gm1
+    JOIN group_members gm2 ON gm2.group_id = gm1.group_id AND gm2.user_id != gm1.user_id
+    WHERE gm1.user_id = ?
+  `, [uid]).map(r => r.user_id);
+
+  let groupSignalByListing = {};
+  if (otherMemberIds.length && listings.length) {
+    const memberPh  = otherMemberIds.map(() => '?').join(',');
+    const listingPh = listings.map(() => '?').join(',');
+    const signals = dbAll(`
+      SELECT listing_id, action FROM swipes
+      WHERE user_id IN (${memberPh}) AND listing_id IN (${listingPh}) AND action IN ('like','superlike','dislike')
+    `, [...otherMemberIds, ...listings.map(l => l.id)]);
+    for (const s of signals) {
+      const cur = groupSignalByListing[s.listing_id];
+      // A listing keeps its BEST signal if groupmates disagree (any
+      // superlike beats any like, which beats an all-dislike signal).
+      const rank = { superlike: 0, like: 1, dislike: 2 }[s.action];
+      if (cur === undefined || rank < cur) groupSignalByListing[s.listing_id] = rank;
+    }
+  }
+  const tierOf = (listing) => {
+    const sig = groupSignalByListing[listing.id];
+    if (sig === 0) return 0; // superliked by groupmate
+    if (sig === 1) return 1; // liked by groupmate
+    if (sig === 2) return 3; // disliked by groupmate
+    return 2;                // no group signal — "neuste Inserate"
+  };
+
+  listings.sort((a, b) => {
+    const skipA = a._skip_marker === 'skip' ? 1 : 0;
+    const skipB = b._skip_marker === 'skip' ? 1 : 0;
+    if (skipA !== skipB) return skipA - skipB;
+    const tierA = tierOf(a), tierB = tierOf(b);
+    if (tierA !== tierB) return tierA - tierB;
+    return new Date(b.added_at + 'Z') - new Date(a.added_at + 'Z');
+  });
+
   res.json({ listings });
 });
 
@@ -1063,6 +1137,66 @@ app.post('/api/jobs/:id/run', requireAuth, async (req, res) => {
   runJob(job);
 });
 
+// Deletes every listing this job previously found (and anything hanging
+// off those listings: swipes, contacts, archive notes) so the next poll
+// treats every URL as brand new and re-scrapes it from scratch with the
+// current scraper logic. Useful after a scraper bug fix, to flush out
+// old listings that were saved with incorrect/garbled data.
+function resetJobListings(jobId) {
+  const ids = dbAll('SELECT id FROM listings WHERE source_job_id=?', [jobId]).map(r => r.id);
+  if (!ids.length) return 0;
+  const placeholders = ids.map(() => '?').join(',');
+  dbRun(`DELETE FROM swipes          WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM contacts        WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM archive_notes   WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM listing_changes WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM listings        WHERE id IN (${placeholders})`, ids);
+  dbRun('UPDATE search_jobs SET last_run=NULL, last_error=NULL, last_new=0, total_found=0 WHERE id=?', [jobId]);
+  return ids.length;
+}
+
+function canManageJob(job, user) {
+  return !!user?.is_admin || job.added_by === user?.id;
+}
+
+app.post('/api/jobs/:id/reset', requireAuth, async (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+
+  const removed = resetJobListings(job.id);
+  saveDb();
+  res.json({ success: true, removed, message: `${removed} Inserate entfernt, Suchagent wird neu gescannt…` });
+
+  const freshJob = dbGet('SELECT * FROM search_jobs WHERE id=?', [job.id]);
+  runJob(freshJob);
+});
+
+app.post('/api/jobs/reset-all', requireAuth, async (req, res) => {
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  const jobs = user?.is_admin
+    ? dbAll('SELECT * FROM search_jobs')
+    : dbAll('SELECT * FROM search_jobs WHERE added_by=?', [user.id]);
+
+  if (!jobs.length) return res.json({ success: true, jobCount: 0, removed: 0 });
+
+  let totalRemoved = 0;
+  for (const job of jobs) totalRemoved += resetJobListings(job.id);
+  saveDb();
+  res.json({ success: true, jobCount: jobs.length, removed: totalRemoved,
+    message: `${jobs.length} Suchagenten zurückgesetzt, ${totalRemoved} Inserate entfernt.` });
+
+  // Re-run each job in the background, spaced slightly apart so they don't
+  // all hammer external sites in the exact same instant.
+  jobs.forEach((job, i) => {
+    setTimeout(() => {
+      const freshJob = dbGet('SELECT * FROM search_jobs WHERE id=?', [job.id]);
+      if (freshJob) runJob(freshJob);
+    }, i * 2000);
+  });
+});
+
 // ── Job runner ─────────────────────────────────────────────
 async function runJob(job) {
   console.log(`[Poller] Job: ${job.label}`);
@@ -1113,20 +1247,73 @@ async function runJob(job) {
   }
 }
 
+// Notify users who liked/superliked a listing about something relevant
+// happening to it (price change, now reserved, etc.) — sent immediately
+// via push/ntfy, similar to match notifications, since these are rare,
+// high-value, time-sensitive events rather than a routine digest item.
+async function notifyListingWatchers(listingId, title, body) {
+  const watchers = dbAll(`
+    SELECT u.id, u.username, u.notify_push, u.ntfy_topic, u.ntfy_server
+    FROM users u
+    JOIN swipes s ON s.user_id = u.id AND s.listing_id = ? AND s.action IN ('like','superlike')
+  `, [listingId]);
+  for (const w of watchers) {
+    if (w.notify_push) await sendPushToUser(w.id, { title, body, url: '/', icon: '/icon-192.png' });
+    if (w.ntfy_topic)  await sendNtfy(w, title, body);
+  }
+}
+
+const CHANGE_FIELD_LABELS = {
+  title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer',
+};
+
 // ── Status checker (runs every 6h) ────────────────────────
+// Re-scrapes every active listing to catch two kinds of updates:
+//  1) status flips (now offline/reserved) — archives + notifies watchers
+//  2) field changes (title/price/size/rooms edited by the landlord) —
+//     recorded in listing_changes for the detail view's history, and
+//     watchers get notified about price drops or a title rewrite.
 async function runStatusCheck() {
-  const listings = dbAll("SELECT id,url,platform FROM listings WHERE status='active'");
+  const listings = dbAll("SELECT id,url,platform,title,price,price_cold,size,rooms FROM listings WHERE status='active'");
   if (!listings.length) return;
   console.log(`[Status] Prüfe ${listings.length} aktive Inserate…`);
-  const { offline, reserved } = await checkExistingListings(listings, (id, status) => {
-    dbRun("UPDATE listings SET status=? WHERE id=?", [status, id]);
-    if (status === 'offline') {
-      try { dbRun("INSERT OR IGNORE INTO archive_notes (listing_id,reason) VALUES (?,?)", [id, 'offline']); } catch(_){}
+
+  const { offline, reserved, changed } = await checkExistingListings(
+    listings,
+    (id, status) => {
+      dbRun("UPDATE listings SET status=? WHERE id=?", [status, id]);
+      if (status === 'offline') {
+        try { dbRun("INSERT OR IGNORE INTO archive_notes (listing_id,reason) VALUES (?,?)", [id, 'offline']); } catch(_){}
+      }
+      saveDb();
+      console.log(`[Status] Inserat ${id} → ${status}`);
+      const listing = dbGet('SELECT title FROM listings WHERE id=?', [id]);
+      const label = status === 'reserved' ? 'jetzt reserviert' : 'jetzt offline';
+      notifyListingWatchers(id, `📌 Inserat ${label}`, listing?.title || '').catch(() => {});
+    },
+    (id, fieldChanges, fresh) => {
+      for (const { field, oldVal, newVal } of fieldChanges) {
+        dbRun('INSERT INTO listing_changes (listing_id,field,old_value,new_value) VALUES (?,?,?,?)',
+          [id, field, oldVal, newVal]);
+      }
+      const setClauses = fieldChanges.map(c => `${c.field}=?`).join(', ');
+      dbRun(`UPDATE listings SET ${setClauses} WHERE id=?`, [...fieldChanges.map(c => c.newVal), id]);
+      saveDb();
+      console.log(`[Status] Inserat ${id} geändert: ${fieldChanges.map(c => c.field).join(', ')}`);
+
+      // Only nudge watchers for the changes people actually care about —
+      // a price drop or a rewritten title, not every minor field tweak.
+      const priceChange = fieldChanges.find(c => c.field === 'price' || c.field === 'price_cold');
+      const titleChange = fieldChanges.find(c => c.field === 'title');
+      if (priceChange) {
+        const label = CHANGE_FIELD_LABELS[priceChange.field];
+        notifyListingWatchers(id, `💶 ${label} geändert`, `${fresh.title || ''}: ${priceChange.oldVal} → ${priceChange.newVal}`).catch(() => {});
+      } else if (titleChange) {
+        notifyListingWatchers(id, '✏️ Titel geändert', `${titleChange.oldVal} → ${titleChange.newVal}`).catch(() => {});
+      }
     }
-    saveDb();
-    console.log(`[Status] Inserat ${id} → ${status}`);
-  });
-  console.log(`[Status] ${offline||0} offline, ${reserved||0} reserviert`);
+  );
+  console.log(`[Status] ${offline||0} offline, ${reserved||0} reserviert, ${changed||0} geändert`);
 }
 
 // ── ntfy helper ───────────────────────────────────────────
@@ -1167,7 +1354,7 @@ async function sendNtfy(user, title, body, view = '') {
   const tags      = extractNtfyTags(title + ' ' + body);
 
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method:  'POST',
       headers: {
         'Title':         safeTitle,
@@ -1178,6 +1365,16 @@ async function sendNtfy(user, title, body, view = '') {
       body: safeBody,
       timeout: 8000,
     });
+    // fetch() only rejects on network-level failures (DNS, connection
+    // refused, timeout) — it does NOT throw on HTTP error responses like
+    // 403/500, so without this check a blocked/misconfigured/unreachable
+    // ntfy server would silently be logged as "sent" even though nothing
+    // was ever delivered.
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.warn(`[ntfy] Failed for user ${user.id} (HTTP ${res.status} ${res.statusText}): ${errBody.substring(0, 200)}`);
+      return;
+    }
     console.log(`[ntfy] Sent to ${user.ntfy_topic}: ${safeTitle}`);
   } catch (e) {
     console.warn(`[ntfy] Failed for user ${user.id}: ${e.message}`);
@@ -1322,6 +1519,44 @@ app.get('/api/admin/users', requireAuth, (req, res) => {
   if (!me?.is_admin) return res.status(403).json({ error: 'Kein Zugriff' });
   const users = dbAll('SELECT id,username,email,is_admin,created_at FROM users ORDER BY created_at ASC');
   res.json({ users });
+});
+
+// ── Email unsubscribe (no auth – token-based) ────────────────────────────────
+app.get('/api/notify/unsubscribe-email', (req, res) => {
+  const { token } = req.query;
+  if (!token) {
+    return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+    <title>Abmelden – WohnungsSwipe</title>
+    <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+    h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
+    </head><body><div class="box"><h2>Ungültiger Link</h2><p>Dieser Abmelde-Link ist nicht gültig oder bereits abgelaufen.</p></div></body></html>`);
+  }
+
+  const user = dbGet('SELECT * FROM users WHERE unsubscribe_token=?', [token]);
+  if (!user) {
+    return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+    <title>Abmelden – WohnungsSwipe</title>
+    <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+    h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
+    </head><body><div class="box"><h2>Link ungültig</h2><p>Dieser Link ist nicht mehr gültig. Du kannst Benachrichtigungen auch direkt im Profil deaktivieren.</p></div></body></html>`);
+  }
+
+  dbRun('UPDATE users SET notify_email=0 WHERE id=?', [user.id]);
+  saveDb();
+
+  res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+  <title>Abgemeldet – WohnungsSwipe</title>
+  <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+  .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+  h2{color:#5bdc8a;margin-bottom:12px}p{color:#9b9896;font-size:.9rem;line-height:1.6}
+  a{color:#e8c97a}</style>
+  </head><body><div class="box">
+  <h2>✓ Abgemeldet</h2>
+  <p>Du erhältst keine E-Mail-Benachrichtigungen mehr von WohnungsSwipe.</p>
+  <p style="margin-top:16px"><a href="${process.env.BASE_URL || 'http://localhost:3000'}">Zurück zur App →</a></p>
+  </div></body></html>`);
 });
 
 // ── Password reset page ────────────────────────────────────

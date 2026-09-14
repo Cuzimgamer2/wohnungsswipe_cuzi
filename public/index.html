@@ -299,6 +299,10 @@
         </div>
       </div>
 
+      <div class="jobs-list-header" id="jobs-list-header" style="display:none">
+        <p class="section-label" style="margin-bottom:0">Meine Suchagenten</p>
+        <button class="btn-ghost" id="reset-all-jobs-btn" style="font-size:.78rem;padding:6px 12px">🔄 Alle zurücksetzen</button>
+      </div>
       <div id="jobs-list"></div>
       <div id="jobs-empty" class="empty-state" style="display:none">
         <div class="empty-icon">📡</div>
@@ -531,6 +535,7 @@
      becomes the exception rather than the default habit. -->
 <div id="detail-view" class="detail-view" style="display:none">
   <div class="detail-view-inner">
+    <a class="detail-quick-original" id="detail-quick-original" href="#" target="_blank" rel="noopener" title="Original-Inserat öffnen">🔗</a>
     <button class="detail-close" id="detail-close">✕</button>
 
     <div class="detail-gallery" id="detail-gallery">
@@ -550,6 +555,8 @@
       <div class="detail-meta" id="detail-meta"></div>
 
       <div class="detail-costs" id="detail-costs" style="display:none"></div>
+
+      <div class="detail-changes" id="detail-changes" style="display:none"></div>
 
       <div class="detail-tags" id="detail-tags"></div>
 
