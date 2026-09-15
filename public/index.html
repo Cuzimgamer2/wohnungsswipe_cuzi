@@ -453,7 +453,7 @@
         <!-- Email -->
         <div class="toggle-list" style="margin-top:4px">
           <label class="toggle-row">
-            <span>📧 E-Mail-Benachrichtigungen</span>
+            <span>📧 E-Mail-Versand grundsätzlich aktiv</span>
             <input type="checkbox" id="notify-email" class="toggle-cb" />
             <span class="toggle-switch"></span>
           </label>
@@ -464,20 +464,48 @@
       </div>
 
       <div class="settings-section">
-        <div class="section-label">Benachrichtigungen – Ereignisse</div>
-        <div class="toggle-list">
-          <label class="toggle-row">
-            <span>🎉 Match in Gruppe</span>
-            <span class="toggle-sub-hint">Immer sofort – auch bei Digest</span>
-            <input type="checkbox" id="notify-match" class="toggle-cb" />
-            <span class="toggle-switch"></span>
-          </label>
-          <label class="toggle-row">
-            <span>📡 Neue Inserate</span>
-            <input type="checkbox" id="notify-new" class="toggle-cb" />
-            <span class="toggle-switch"></span>
-          </label>
+        <div class="section-label">Benachrichtigungen – wer bekommt was?</div>
+        <p class="notify-sub" style="margin-bottom:12px">Wähle pro Ereignis, über welche Kanäle du informiert werden möchtest.</p>
+        <div class="notify-matrix" id="notify-matrix">
+          <div class="notify-matrix-header">
+            <span></span>
+            <span title="E-Mail">📧</span>
+            <span title="Browser-Push">🔔</span>
+            <span title="ntfy">📲</span>
+          </div>
+          <div class="notify-matrix-row" data-type="match">
+            <span class="notify-matrix-label">🎉 Match in Gruppe</span>
+            <input type="checkbox" data-channel="email" />
+            <input type="checkbox" data-channel="push" />
+            <input type="checkbox" data-channel="ntfy" />
+          </div>
+          <div class="notify-matrix-row" data-type="new">
+            <span class="notify-matrix-label">📡 Neue Inserate</span>
+            <input type="checkbox" data-channel="email" />
+            <input type="checkbox" data-channel="push" />
+            <input type="checkbox" data-channel="ntfy" />
+          </div>
+          <div class="notify-matrix-row" data-type="nudge">
+            <span class="notify-matrix-label">👋 Anstupsen</span>
+            <input type="checkbox" data-channel="email" />
+            <input type="checkbox" data-channel="push" />
+            <input type="checkbox" data-channel="ntfy" />
+          </div>
+          <div class="notify-matrix-row" data-type="change">
+            <span class="notify-matrix-label">🔄 Inserat-Änderungen</span>
+            <input type="checkbox" data-channel="email" />
+            <input type="checkbox" data-channel="push" />
+            <input type="checkbox" data-channel="ntfy" />
+          </div>
         </div>
+        <p class="notify-sub" style="font-size:.72rem;margin-top:8px">
+          Match-Benachrichtigungen kommen immer sofort, unabhängig vom Digest-Intervall unten.
+        </p>
+        <p class="form-success" id="notify-matrix-ok"></p>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-label">Sammelbenachrichtigung für „Neue Inserate"</div>
 
         <!-- Digest interval -->
         <div class="digest-row" id="digest-row">
@@ -536,6 +564,7 @@
 <div id="detail-view" class="detail-view" style="display:none">
   <div class="detail-view-inner">
     <a class="detail-quick-original" id="detail-quick-original" href="#" target="_blank" rel="noopener" title="Original-Inserat öffnen">🔗</a>
+    <button class="detail-quick-share" id="detail-quick-share" title="Inserat teilen">📤</button>
     <button class="detail-close" id="detail-close">✕</button>
 
     <div class="detail-gallery" id="detail-gallery">

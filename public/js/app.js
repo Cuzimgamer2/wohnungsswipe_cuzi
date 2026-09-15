@@ -155,6 +155,7 @@ function onLogin(data) {
   $id('nav-username').textContent = data.username;
   showScreen('app-screen');
   loadGroups().then(() => loadSwipeQueue());
+  openSharedListingFromUrl();
 }
 
 async function doLogout() {
@@ -430,6 +431,27 @@ $id('detail-close').onclick        = () => detailView.close();
 $id('detail-gallery-prev').onclick = () => detailView.galleryGo(-1);
 $id('detail-gallery-next').onclick = () => detailView.galleryGo(1);
 $id('detail-view').addEventListener('click', e => { if (e.target.id === 'detail-view') detailView.close(); });
+
+$id('detail-quick-share').onclick = async () => {
+  if (!detailView.listing) return;
+  const shareUrl   = `${location.origin}${location.pathname}?listing=${detailView.listing.id}`;
+  const shareTitle = detailView.listing.title || 'Inserat';
+  const priceStr   = detailView.listing.price_cold || detailView.listing.price || '';
+  const shareText  = priceStr ? `${shareTitle} – ${priceStr}` : shareTitle;
+
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: shareTitle, text: shareText, url: shareUrl });
+    } catch (e) { /* user cancelled the native share sheet — nothing to do */ }
+  } else {
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      toast('🔗 Link kopiert!');
+    } catch (e) {
+      toast('❌ Konnte Link nicht kopieren');
+    }
+  }
+};
 
 $id('detail-btn-like').onclick = () => {
   if (detailView.listing) { doSwipe(detailView.listing, 'like'); detailView.close(); }
@@ -955,7 +977,27 @@ function attachDrag(card, listing) {
 
 async function doSwipe(listing, action) {
   const card = $id('card-stack').querySelector(`.swipe-card[data-id="${listing.id}"]`);
-  if (!card || card.classList.contains('fly-left') || card.classList.contains('fly-right') || card.classList.contains('fly-up') || card.classList.contains('fly-down')) return;
+  const isFlying = card && (card.classList.contains('fly-left') || card.classList.contains('fly-right') || card.classList.contains('fly-up') || card.classList.contains('fly-down'));
+  if (isFlying) return;
+
+  const toastMsg = {
+    like:      '💚 Gefällt dir!',
+    dislike:   '✕ Abgelehnt',
+    superlike: '⭐ Super-Like!',
+    skip:      '⏭ Übersprungen – kommt später wieder',
+  }[action];
+
+  // Fire API in background
+  api('/api/listings/swipe', { method: 'POST', body: { listingId: listing.id, action } });
+
+  // Track for the undo button (always remembers the most recent swipe in this session)
+  state.lastSwipe = { listing, action };
+  updateUndoButton();
+
+  // No matching card in the stack — this listing was never part of the
+  // active swipe queue (e.g. opened directly via a shared link). Just
+  // record the swipe and confirm with a toast; there's no card to animate.
+  if (!card) { toast(toastMsg); return; }
 
   // Detach drag immediately
   if (_dragCleanup) { _dragCleanup(); _dragCleanup = null; }
@@ -969,21 +1011,7 @@ async function doSwipe(listing, action) {
 
   const flyClass = { like: 'fly-right', dislike: 'fly-left', superlike: 'fly-up', skip: 'fly-down' }[action];
   card.classList.add(flyClass);
-
-  const toastMsg = {
-    like:      '💚 Gefällt dir!',
-    dislike:   '✕ Abgelehnt',
-    superlike: '⭐ Super-Like!',
-    skip:      '⏭ Übersprungen – kommt später wieder',
-  }[action];
   toast(toastMsg);
-
-  // Fire API in background
-  api('/api/listings/swipe', { method: 'POST', body: { listingId: listing.id, action } });
-
-  // Track for the undo button (always remembers the most recent swipe in this session)
-  state.lastSwipe = { listing, action };
-  updateUndoButton();
 
   // Remove from queue immediately so renderStack knows what's next.
   // Skipped listings get pushed to the back of the queue instead of removed entirely,
@@ -1758,8 +1786,16 @@ async function loadSettings() {
 
   // Notification toggles
   $id('notify-email').checked = !!me.notify_email;
-  $id('notify-match').checked = !!me.notify_match;
-  $id('notify-new').checked   = !!me.notify_new;
+
+  // Per-type/per-channel matrix
+  const matrix = me.notify_matrix || {};
+  document.querySelectorAll('.notify-matrix-row').forEach(row => {
+    const type = row.dataset.type;
+    row.querySelectorAll('input[data-channel]').forEach(cb => {
+      const channel = cb.dataset.channel;
+      cb.checked = !!matrix[type]?.[channel];
+    });
+  });
 
   // ntfy fields
   $id('ntfy-topic').value  = me.ntfy_topic  || '';
@@ -1821,9 +1857,24 @@ $id('save-password-btn').addEventListener('click', async () => {
   setOk('settings-pw-ok','✓ Passwort geändert'); toast('✅ Passwort geändert');
 });
 
+// Reads the current state of all matrix checkboxes into a plain object
+// like { match: {email,push,ntfy}, new: {...}, nudge: {...}, change: {...} }
+function readMatrixFromUI() {
+  const matrix = {};
+  document.querySelectorAll('.notify-matrix-row').forEach(row => {
+    const type = row.dataset.type;
+    matrix[type] = {};
+    row.querySelectorAll('input[data-channel]').forEach(cb => {
+      matrix[type][cb.dataset.channel] = cb.checked;
+    });
+  });
+  return matrix;
+}
+
 // Notification toggles save on change
-['notify-email','notify-match','notify-new'].forEach(id => {
-  $id(id).addEventListener('change', saveNotifySettings);
+$id('notify-email').addEventListener('change', saveNotifySettings);
+document.querySelectorAll('.notify-matrix-row input[data-channel]').forEach(cb => {
+  cb.addEventListener('change', saveNotifySettings);
 });
 
 // Digest interval buttons
@@ -1841,12 +1892,11 @@ $id('save-ntfy-btn').addEventListener('click', async () => {
   const d = await api('/api/user/notifications', { method:'PUT', body:{
     notify_email: $id('notify-email').checked ? 1 : 0,
     notify_push:  1,
-    notify_match: $id('notify-match').checked ? 1 : 0,
-    notify_new:   $id('notify-new').checked   ? 1 : 0,
     notify_digest_interval: document.querySelector('.digest-btn.active')?.dataset.interval || 'instant',
     ntfy_topic:       $id('ntfy-topic').value.trim(),
     ntfy_server:      $id('ntfy-server').value.trim(),
     notify_threshold: parseInt($id('notify-threshold')?.value) || 1,
+    notify_matrix:    readMatrixFromUI(),
   }});
   if (d.success) { setOk('ntfy-ok','✓ Gespeichert'); toast('✅ ntfy gespeichert'); }
 });
@@ -1855,14 +1905,13 @@ async function saveNotifySettings() {
   const d = await api('/api/user/notifications', { method:'PUT', body:{
     notify_email:           $id('notify-email').checked ? 1 : 0,
     notify_push:            1,
-    notify_match:           $id('notify-match').checked ? 1 : 0,
-    notify_new:             $id('notify-new').checked   ? 1 : 0,
     notify_digest_interval: document.querySelector('.digest-btn.active')?.dataset.interval || 'instant',
     ntfy_topic:             $id('ntfy-topic').value.trim(),
     ntfy_server:            $id('ntfy-server').value.trim(),
     notify_threshold:       parseInt($id('notify-threshold')?.value) || 1,
+    notify_matrix:          readMatrixFromUI(),
   }});
-  if (d.success) setOk('notify-ok','✓ Gespeichert');
+  if (d.success) setOk('notify-matrix-ok','✓ Gespeichert');
 }
 
 // ── Web Push ──────────────────────────────────────────────
@@ -2009,6 +2058,27 @@ $id('admin-users-btn')?.addEventListener('click', async () => {
   });
 });
 
+// Opens the detail view for a listing referenced by a shared link
+// (?listing=<id> in the URL), then cleans the URL so a refresh doesn't
+// re-trigger it. Works for any listing the current user can technically
+// see via GET /api/listings/:id (bypasses the normal swipe-queue
+// visibility scoping — see that endpoint's comment for why).
+async function openSharedListingFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const sharedId = params.get('listing');
+  if (!sharedId) return;
+
+  // Strip the param immediately regardless of outcome, so the URL is
+  // clean and a page refresh won't keep re-opening the same listing.
+  params.delete('listing');
+  const cleanUrl = location.pathname + (params.toString() ? `?${params}` : '') + location.hash;
+  history.replaceState({}, '', cleanUrl);
+
+  const d = await api(`/api/listings/${sharedId}`);
+  if (d.error || !d.listing) { toast('❌ Geteiltes Inserat nicht gefunden'); return; }
+  detailView.open(d.listing, { fromSwipe: true });
+}
+
 // ══════════════════════════════════════════════════════════
 //  INIT
 // ══════════════════════════════════════════════════════════
@@ -2020,6 +2090,7 @@ $id('admin-users-btn')?.addEventListener('click', async () => {
     showScreen('app-screen');
     await loadGroups();
     loadSwipeQueue();
+    openSharedListingFromUrl();
   } else {
     showScreen('auth-screen');
   }

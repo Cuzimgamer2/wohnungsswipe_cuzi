@@ -73,7 +73,8 @@ async function initDb() {
       ntfy_server            TEXT    DEFAULT '',
       notify_threshold       INTEGER DEFAULT 1,
       unsubscribe_token      TEXT    DEFAULT '',
-      is_admin               INTEGER DEFAULT 0
+      is_admin               INTEGER DEFAULT 0,
+      notify_matrix          TEXT
     );
     CREATE TABLE IF NOT EXISTS groups_table (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,6 +213,26 @@ async function initDb() {
   migrate("ALTER TABLE listings    ADD COLUMN latitude        REAL");
   migrate("ALTER TABLE listings    ADD COLUMN longitude       REAL");
   migrate("ALTER TABLE search_jobs ADD COLUMN visibility_id INTEGER");
+  migrate("ALTER TABLE users       ADD COLUMN notify_matrix   TEXT");
+
+  // One-time seed: build each user's new per-type/per-channel matrix from
+  // their old blanket toggles, so nobody's existing preferences silently
+  // reset to defaults when this feature ships.
+  try {
+    const usersNeedingSeed = dbAll("SELECT id, notify_email, notify_match, notify_new FROM users WHERE notify_matrix IS NULL OR notify_matrix = ''");
+    for (const u of usersNeedingSeed) {
+      const matrix = {
+        match:  { email: !!u.notify_email, push: true, ntfy: true },
+        new:    { email: !!u.notify_email, push: true, ntfy: true },
+        nudge:  { email: false, push: true, ntfy: true },
+        change: { email: false, push: true, ntfy: true },
+      };
+      if (!u.notify_match) matrix.match = { email: false, push: false, ntfy: false };
+      if (!u.notify_new)   matrix.new   = { email: false, push: false, ntfy: false };
+      dbRun('UPDATE users SET notify_matrix=? WHERE id=?', [JSON.stringify(matrix), u.id]);
+    }
+    if (usersNeedingSeed.length) console.log(`[Migration] Notification-Matrix für ${usersNeedingSeed.length} Nutzer angelegt`);
+  } catch (e) { console.error('[Migration] notify_matrix seed:', e.message); }
 
   // Migrate swipes table CHECK constraint to allow 'skip' (SQLite needs table rebuild for this)
   try {
@@ -290,6 +311,41 @@ app.use(session({
   saveUninitialized: false,
   cookie:            { maxAge: 7 * 24 * 60 * 60 * 1000 },
 }));
+// ── Per-type, per-channel notification preferences ──────────
+// Users can choose exactly which channel(s) they want for each kind of
+// notification, instead of one blanket on/off per channel. The matrix is
+// stored as JSON on users.notify_matrix; these are the defaults applied
+// whenever a type/channel combo isn't explicitly set (keeps prior
+// behaviour for anyone who hasn't touched their settings yet).
+const DEFAULT_NOTIFY_MATRIX = {
+  match:  { email: true,  push: true, ntfy: true },
+  new:    { email: true,  push: true, ntfy: true },
+  nudge:  { email: false, push: true, ntfy: true },
+  change: { email: false, push: true, ntfy: true },
+};
+
+function getNotifyMatrix(user) {
+  let stored = {};
+  try { stored = JSON.parse(user.notify_matrix || '{}'); } catch (_) { stored = {}; }
+  const merged = {};
+  for (const type of Object.keys(DEFAULT_NOTIFY_MATRIX)) {
+    merged[type] = { ...DEFAULT_NOTIFY_MATRIX[type], ...(stored[type] || {}) };
+  }
+  return merged;
+}
+
+// Combines the user's per-type preference with the "is this channel even
+// usable" technical gate — push needs an active browser subscription,
+// ntfy needs a topic configured, email just needs the toggle itself.
+function shouldNotify(user, type, channel) {
+  const matrix = getNotifyMatrix(user);
+  if (!matrix[type]?.[channel]) return false;
+  if (channel === 'push')  return !!user.notify_push;
+  if (channel === 'ntfy')  return !!user.ntfy_topic;
+  if (channel === 'email') return true;
+  return false;
+}
+
 const requireAuth = (req, res, next) =>
   req.session.userId ? next() : res.status(401).json({ error: 'Nicht eingeloggt' });
 
@@ -330,8 +386,9 @@ app.post('/api/auth/logout', (req, res) => { req.session.destroy(); res.json({ s
 
 app.get('/api/auth/me', (req, res) => {
   if (!req.session.userId) return res.json({ loggedIn: false });
-  const user = dbGet('SELECT id,username,email,created_at,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,ntfy_topic,ntfy_server,notify_threshold,is_admin FROM users WHERE id=?', [req.session.userId]);
-  res.json(user ? { loggedIn: true, ...user } : { loggedIn: false });
+  const user = dbGet('SELECT id,username,email,created_at,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,ntfy_topic,ntfy_server,notify_threshold,notify_matrix,is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!user) return res.json({ loggedIn: false });
+  res.json({ loggedIn: true, ...user, notify_matrix: getNotifyMatrix(user) });
 });
 
 app.get('/api/auth/stats', requireAuth, (req, res) => {
@@ -414,21 +471,43 @@ app.put('/api/user/password', requireAuth, async (req, res) => {
 
 app.put('/api/user/notifications', requireAuth, (req, res) => {
   const { notify_email, notify_push, notify_match, notify_new,
-          notify_digest_interval, ntfy_topic, ntfy_server, notify_threshold } = req.body;
+          notify_digest_interval, ntfy_topic, ntfy_server, notify_threshold, notify_matrix } = req.body;
   const validIntervals = ['instant','15min','1h','6h','daily'];
   const interval    = validIntervals.includes(notify_digest_interval) ? notify_digest_interval : 'instant';
   const threshold   = Math.max(1, Math.min(100, parseInt(notify_threshold) || 1));
-  dbRun('UPDATE users SET notify_email=?,notify_push=?,notify_match=?,notify_new=?,notify_digest_interval=?,ntfy_topic=?,ntfy_server=?,notify_threshold=? WHERE id=?', [
+
+  // Merge any provided matrix fields into the user's existing stored
+  // matrix (rather than replacing it wholesale), so toggling a single
+  // checkbox doesn't wipe out other type/channel preferences.
+  const current = dbGet('SELECT notify_matrix FROM users WHERE id=?', [req.session.userId]);
+  let matrixToSave = current?.notify_matrix || null;
+  if (notify_matrix && typeof notify_matrix === 'object') {
+    let existing = {};
+    try { existing = JSON.parse(current?.notify_matrix || '{}'); } catch (_) { existing = {}; }
+    for (const type of Object.keys(DEFAULT_NOTIFY_MATRIX)) {
+      if (!notify_matrix[type]) continue;
+      existing[type] = existing[type] || {};
+      for (const ch of ['email', 'push', 'ntfy']) {
+        if (typeof notify_matrix[type][ch] !== 'undefined') {
+          existing[type][ch] = !!notify_matrix[type][ch];
+        }
+      }
+    }
+    matrixToSave = JSON.stringify(existing);
+  }
+
+  dbRun('UPDATE users SET notify_email=?,notify_push=?,notify_match=?,notify_new=?,notify_digest_interval=?,ntfy_topic=?,ntfy_server=?,notify_threshold=?,notify_matrix=? WHERE id=?', [
     notify_email ? 1 : 0, notify_push ? 1 : 0,
     notify_match ? 1 : 0, notify_new  ? 1 : 0,
     interval,
     (ntfy_topic || '').trim().substring(0, 200),
     (ntfy_server || '').trim().substring(0, 200),
     threshold,
+    matrixToSave,
     req.session.userId,
   ]);
   saveDb();
-  res.json({ success: true });
+  res.json({ success: true, notify_matrix: getNotifyMatrix({ notify_matrix: matrixToSave }) });
 });
 
 // ── Web Push ───────────────────────────────────────────────
@@ -502,12 +581,12 @@ async function checkAndNotifyMatch(listingId, groupId) {
   console.log(`[Notify] Match! Gruppe "${group.name}" für Inserat "${listing.title}"`);
 
   for (const uid of memberIds) {
-    const user = dbGet('SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,ntfy_topic,ntfy_server,unsubscribe_token FROM users WHERE id=?', [uid]);
-    if (!user || !user.notify_match) continue;
+    const user = dbGet('SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,ntfy_topic,ntfy_server,notify_matrix,unsubscribe_token FROM users WHERE id=?', [uid]);
+    if (!user) continue;
 
     // Matches are always delivered immediately regardless of digest setting
     // (matches are rare and time-sensitive)
-    if (user.notify_push) {
+    if (shouldNotify(user, 'match', 'push')) {
       await sendPushToUser(uid, {
         title: `🎉 Match in "${group.name}"!`,
         body:  listing.title.substring(0, 80),
@@ -515,10 +594,10 @@ async function checkAndNotifyMatch(listingId, groupId) {
         icon:  '/icon-192.png',
       });
     }
-    if (user.ntfy_topic) {
+    if (shouldNotify(user, 'match', 'ntfy')) {
       await sendNtfy(user, `🎉 Match in "${group.name}"!`, listing.title.substring(0, 80), 'groups');
     }
-    if (user.notify_email) {
+    if (shouldNotify(user, 'match', 'email')) {
       await mailer.sendMatchMail(user.email, user.username, group.name, listing, user.unsubscribe_token || '');
     }
   }
@@ -815,6 +894,25 @@ app.get('/api/listings/liked', requireAuth, (req, res) => {
   res.json({ listings: liked || [] });
 });
 
+// Fetch a single listing by ID for the share feature — any logged-in user
+// can open a listing they were sent a direct link to, regardless of the
+// normal group/private visibility rules that govern the swipe queue.
+// Visibility there exists to keep feeds relevant, not as a privacy
+// boundary on apartment listing data, so an explicit share link
+// intentionally overrides it (same idea as "anyone with the link").
+// Registered AFTER all the more specific literal /api/listings/... routes
+// above (swipe, rated, liked, mine) so this :id wildcard doesn't shadow them.
+app.get('/api/listings/:id', requireAuth, (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  const listing = dbGet(
+    `SELECT l.*, (SELECT action FROM swipes WHERE listing_id=l.id AND user_id=?) as my_swipe
+     FROM listings l WHERE l.id=?`,
+    [req.session.userId, req.params.id]
+  );
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  res.json({ listing });
+});
+
 // ── Archive ───────────────────────────────────────────────
 // Returns offline listings that this user has swiped on
 app.get('/api/archive', requireAuth, (req, res) => {
@@ -970,13 +1068,14 @@ app.post('/api/groups/:id/nudge/:userId', requireAuth, async (req, res) => {
   const nudgeTitle = `${sender?.username || 'Jemand'} erinnert dich ans Swipen!`;
   const nudgeBody  = `Gruppe: ${group.name}`;
 
-  // Browser push
-  if (targetUser.notify_push) {
+  if (shouldNotify(targetUser, 'nudge', 'push')) {
     await sendPushToUser(target, { title: nudgeTitle, body: nudgeBody, url: '/', icon: '/icon-192.png' });
   }
-  // ntfy
-  if (targetUser.ntfy_topic) {
+  if (shouldNotify(targetUser, 'nudge', 'ntfy')) {
     await sendNtfy(targetUser, nudgeTitle, nudgeBody);
+  }
+  if (shouldNotify(targetUser, 'nudge', 'email')) {
+    await mailer.sendNudgeMail(targetUser.email, targetUser.username, sender?.username || 'Jemand', group.name, targetUser.unsubscribe_token || '');
   }
 
   console.log(`[Nudge] ${sender?.username} → ${targetUser.username} in "${group.name}"`);
@@ -1212,19 +1311,23 @@ async function runJob(job) {
     console.log(`[Poller] ${job.label}: ${newCount} neue (${totalFound} auf Seite)`);
 
     // Queue notifications – only for users who can see this job's listings
+    // AND have at least one channel enabled for "new listings" in their matrix
     if (newCount > 0) {
-      let eligibleUsers = [];
+      let candidateUsers = [];
       if (job.visibility === 'global') {
-        eligibleUsers = dbAll('SELECT * FROM users WHERE notify_new=1');
+        candidateUsers = dbAll('SELECT * FROM users');
       } else if (job.visibility === 'private') {
-        eligibleUsers = dbAll('SELECT * FROM users WHERE id=? AND notify_new=1', [job.added_by]);
+        candidateUsers = dbAll('SELECT * FROM users WHERE id=?', [job.added_by]);
       } else if (job.visibility === 'group' && job.visibility_id) {
-        eligibleUsers = dbAll(`
+        candidateUsers = dbAll(`
           SELECT u.* FROM users u
           JOIN group_members gm ON gm.user_id = u.id AND gm.group_id = ?
-          WHERE u.notify_new = 1
         `, [job.visibility_id]);
       }
+      const eligibleUsers = candidateUsers.filter(u => {
+        const m = getNotifyMatrix(u).new;
+        return m.email || m.push || m.ntfy;
+      });
 
       for (const user of eligibleUsers) {
         dbRun(
@@ -1253,13 +1356,14 @@ async function runJob(job) {
 // high-value, time-sensitive events rather than a routine digest item.
 async function notifyListingWatchers(listingId, title, body) {
   const watchers = dbAll(`
-    SELECT u.id, u.username, u.notify_push, u.ntfy_topic, u.ntfy_server
+    SELECT u.id, u.username, u.email, u.notify_push, u.notify_matrix, u.ntfy_topic, u.ntfy_server, u.unsubscribe_token
     FROM users u
     JOIN swipes s ON s.user_id = u.id AND s.listing_id = ? AND s.action IN ('like','superlike')
   `, [listingId]);
   for (const w of watchers) {
-    if (w.notify_push) await sendPushToUser(w.id, { title, body, url: '/', icon: '/icon-192.png' });
-    if (w.ntfy_topic)  await sendNtfy(w, title, body);
+    if (shouldNotify(w, 'change', 'push'))  await sendPushToUser(w.id, { title, body, url: '/', icon: '/icon-192.png' });
+    if (shouldNotify(w, 'change', 'ntfy'))  await sendNtfy(w, title, body);
+    if (shouldNotify(w, 'change', 'email')) await mailer.sendListingChangeMail(w.email, w.username, title, body, w.unsubscribe_token || '');
   }
 }
 
@@ -1386,8 +1490,8 @@ async function sendNtfy(user, title, body, view = '') {
 // Flushes queued notifications for users whose digest_interval matches
 async function flushNotificationQueue(intervalKey) {
   const users = intervalKey === 'all'
-    ? dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,ntfy_topic,ntfy_server,unsubscribe_token FROM users")
-    : dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,ntfy_topic,ntfy_server,unsubscribe_token FROM users WHERE notify_digest_interval=?", [intervalKey]);
+    ? dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,notify_matrix,ntfy_topic,ntfy_server,unsubscribe_token FROM users")
+    : dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,notify_matrix,ntfy_topic,ntfy_server,unsubscribe_token FROM users WHERE notify_digest_interval=?", [intervalKey]);
 
   for (const user of users) {
     const items = dbAll(
@@ -1429,15 +1533,15 @@ async function flushNotificationQueue(intervalKey) {
 
     if (pushTitle && (newListingItems.length || otherItems.length)) {
       // Browser push
-      if (user.notify_push) {
+      if (shouldNotify(user, 'new', 'push')) {
         await sendPushToUser(user.id, { title: pushTitle, body: pushBody, url: '/', icon: '/icon-192.png' });
       }
       // ntfy
-      if (user.ntfy_topic) {
+      if (shouldNotify(user, 'new', 'ntfy')) {
         await sendNtfy(user, pushTitle, pushBody);
       }
       // Email – only send digest email if there are enough items to justify it
-      if (user.notify_email && user.notify_new) {
+      if (shouldNotify(user, 'new', 'email')) {
         const totalCount = newListingItems.reduce((s, i) => {
           return s + parseInt(i.title.match(/\d+/)?.[0] || '0');
         }, 0);
