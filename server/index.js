@@ -73,7 +73,8 @@ async function initDb() {
       ntfy_server            TEXT    DEFAULT '',
       notify_threshold       INTEGER DEFAULT 1,
       unsubscribe_token      TEXT    DEFAULT '',
-      is_admin               INTEGER DEFAULT 0
+      is_admin               INTEGER DEFAULT 0,
+      notify_matrix          TEXT
     );
     CREATE TABLE IF NOT EXISTS groups_table (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,8 +104,18 @@ async function initDb() {
       description TEXT,
       platform    TEXT DEFAULT 'unbekannt',
       status      TEXT DEFAULT 'active',
-      added_by    INTEGER,
-      added_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+      added_by      INTEGER,
+      source_job_id INTEGER,
+      visibility    TEXT DEFAULT 'global',
+      visibility_id INTEGER,
+      nebenkosten     TEXT,
+      heizkosten      TEXT,
+      kaution         TEXT,
+      available_from  TEXT,
+      property_type   TEXT,
+      latitude        REAL,
+      longitude       REAL,
+      added_at      DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS swipes (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,6 +173,14 @@ async function initDb() {
       reason      TEXT DEFAULT 'offline',
       archived_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS listing_changes (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      listing_id INTEGER NOT NULL,
+      field      TEXT NOT NULL,
+      old_value  TEXT,
+      new_value  TEXT,
+      changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   // Migrations
@@ -183,7 +202,37 @@ async function initDb() {
   migrate("ALTER TABLE users    ADD COLUMN unsubscribe_token      TEXT    DEFAULT ''");
   migrate("ALTER TABLE users    ADD COLUMN is_admin               INTEGER DEFAULT 0");
   migrate("ALTER TABLE search_jobs ADD COLUMN visibility    TEXT DEFAULT 'global'");
+  migrate("ALTER TABLE listings    ADD COLUMN source_job_id INTEGER");
+  migrate("ALTER TABLE listings    ADD COLUMN visibility    TEXT DEFAULT 'global'");
+  migrate("ALTER TABLE listings    ADD COLUMN visibility_id INTEGER");
+  migrate("ALTER TABLE listings    ADD COLUMN nebenkosten     TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN heizkosten      TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN kaution         TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN available_from  TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN property_type   TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN latitude        REAL");
+  migrate("ALTER TABLE listings    ADD COLUMN longitude       REAL");
   migrate("ALTER TABLE search_jobs ADD COLUMN visibility_id INTEGER");
+  migrate("ALTER TABLE users       ADD COLUMN notify_matrix   TEXT");
+
+  // One-time seed: build each user's new per-type/per-channel matrix from
+  // their old blanket toggles, so nobody's existing preferences silently
+  // reset to defaults when this feature ships.
+  try {
+    const usersNeedingSeed = dbAll("SELECT id, notify_email, notify_match, notify_new FROM users WHERE notify_matrix IS NULL OR notify_matrix = ''");
+    for (const u of usersNeedingSeed) {
+      const matrix = {
+        match:  { email: !!u.notify_email, push: true, ntfy: true },
+        new:    { email: !!u.notify_email, push: true, ntfy: true },
+        nudge:  { email: false, push: true, ntfy: true },
+        change: { email: false, push: true, ntfy: true },
+      };
+      if (!u.notify_match) matrix.match = { email: false, push: false, ntfy: false };
+      if (!u.notify_new)   matrix.new   = { email: false, push: false, ntfy: false };
+      dbRun('UPDATE users SET notify_matrix=? WHERE id=?', [JSON.stringify(matrix), u.id]);
+    }
+    if (usersNeedingSeed.length) console.log(`[Migration] Notification-Matrix für ${usersNeedingSeed.length} Nutzer angelegt`);
+  } catch (e) { console.error('[Migration] notify_matrix seed:', e.message); }
 
   // Migrate swipes table CHECK constraint to allow 'skip' (SQLite needs table rebuild for this)
   try {
@@ -235,15 +284,18 @@ function dbRun(sql, p = []) {
   } catch (e) { console.error('dbRun:', e.message); throw e; }
 }
 
-function insertListing(data, addedBy = null) {
+function insertListing(data, addedBy = null, sourceJobId = null, visibility = 'global', visibilityId = null) {
   const ex = dbGet('SELECT id FROM listings WHERE url=?', [data.url]);
   if (ex) return { id: ex.id, isNew: false };
   const r = dbRun(
-    'INSERT INTO listings (url,title,price,price_cold,size,location,rooms,image_url,images_json,tags_json,description,platform,status,added_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    'INSERT INTO listings (url,title,price,price_cold,size,location,rooms,image_url,images_json,tags_json,description,platform,status,added_by,source_job_id,visibility,visibility_id,nebenkosten,heizkosten,kaution,available_from,property_type,latitude,longitude) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     [data.url, data.title||'', data.price||'', data.price_cold||'', data.size||'',
      data.location||'', data.rooms||'', data.image_url||'', data.images_json||'[]',
      data.tags_json||'[]', data.description||'', data.platform||'unbekannt',
-     data.status||'active', addedBy]
+     data.status||'active', addedBy, sourceJobId, visibility, visibilityId,
+     data.nebenkosten||'', data.heizkosten||'', data.kaution||'', data.available_from||'', data.property_type||'',
+     Number.isFinite(data.latitude) ? data.latitude : null,
+     Number.isFinite(data.longitude) ? data.longitude : null]
   );
   return { id: r.lastInsertRowid, isNew: true };
 }
@@ -259,6 +311,41 @@ app.use(session({
   saveUninitialized: false,
   cookie:            { maxAge: 7 * 24 * 60 * 60 * 1000 },
 }));
+// ── Per-type, per-channel notification preferences ──────────
+// Users can choose exactly which channel(s) they want for each kind of
+// notification, instead of one blanket on/off per channel. The matrix is
+// stored as JSON on users.notify_matrix; these are the defaults applied
+// whenever a type/channel combo isn't explicitly set (keeps prior
+// behaviour for anyone who hasn't touched their settings yet).
+const DEFAULT_NOTIFY_MATRIX = {
+  match:  { email: true,  push: true, ntfy: true },
+  new:    { email: true,  push: true, ntfy: true },
+  nudge:  { email: false, push: true, ntfy: true },
+  change: { email: false, push: true, ntfy: true },
+};
+
+function getNotifyMatrix(user) {
+  let stored = {};
+  try { stored = JSON.parse(user.notify_matrix || '{}'); } catch (_) { stored = {}; }
+  const merged = {};
+  for (const type of Object.keys(DEFAULT_NOTIFY_MATRIX)) {
+    merged[type] = { ...DEFAULT_NOTIFY_MATRIX[type], ...(stored[type] || {}) };
+  }
+  return merged;
+}
+
+// Combines the user's per-type preference with the "is this channel even
+// usable" technical gate — push needs an active browser subscription,
+// ntfy needs a topic configured, email just needs the toggle itself.
+function shouldNotify(user, type, channel) {
+  const matrix = getNotifyMatrix(user);
+  if (!matrix[type]?.[channel]) return false;
+  if (channel === 'push')  return !!user.notify_push;
+  if (channel === 'ntfy')  return !!user.ntfy_topic;
+  if (channel === 'email') return true;
+  return false;
+}
+
 const requireAuth = (req, res, next) =>
   req.session.userId ? next() : res.status(401).json({ error: 'Nicht eingeloggt' });
 
@@ -299,8 +386,9 @@ app.post('/api/auth/logout', (req, res) => { req.session.destroy(); res.json({ s
 
 app.get('/api/auth/me', (req, res) => {
   if (!req.session.userId) return res.json({ loggedIn: false });
-  const user = dbGet('SELECT id,username,email,created_at,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,ntfy_topic,ntfy_server,notify_threshold,is_admin FROM users WHERE id=?', [req.session.userId]);
-  res.json(user ? { loggedIn: true, ...user } : { loggedIn: false });
+  const user = dbGet('SELECT id,username,email,created_at,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,ntfy_topic,ntfy_server,notify_threshold,notify_matrix,is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!user) return res.json({ loggedIn: false });
+  res.json({ loggedIn: true, ...user, notify_matrix: getNotifyMatrix(user) });
 });
 
 app.get('/api/auth/stats', requireAuth, (req, res) => {
@@ -383,21 +471,43 @@ app.put('/api/user/password', requireAuth, async (req, res) => {
 
 app.put('/api/user/notifications', requireAuth, (req, res) => {
   const { notify_email, notify_push, notify_match, notify_new,
-          notify_digest_interval, ntfy_topic, ntfy_server, notify_threshold } = req.body;
+          notify_digest_interval, ntfy_topic, ntfy_server, notify_threshold, notify_matrix } = req.body;
   const validIntervals = ['instant','15min','1h','6h','daily'];
   const interval    = validIntervals.includes(notify_digest_interval) ? notify_digest_interval : 'instant';
   const threshold   = Math.max(1, Math.min(100, parseInt(notify_threshold) || 1));
-  dbRun('UPDATE users SET notify_email=?,notify_push=?,notify_match=?,notify_new=?,notify_digest_interval=?,ntfy_topic=?,ntfy_server=?,notify_threshold=? WHERE id=?', [
+
+  // Merge any provided matrix fields into the user's existing stored
+  // matrix (rather than replacing it wholesale), so toggling a single
+  // checkbox doesn't wipe out other type/channel preferences.
+  const current = dbGet('SELECT notify_matrix FROM users WHERE id=?', [req.session.userId]);
+  let matrixToSave = current?.notify_matrix || null;
+  if (notify_matrix && typeof notify_matrix === 'object') {
+    let existing = {};
+    try { existing = JSON.parse(current?.notify_matrix || '{}'); } catch (_) { existing = {}; }
+    for (const type of Object.keys(DEFAULT_NOTIFY_MATRIX)) {
+      if (!notify_matrix[type]) continue;
+      existing[type] = existing[type] || {};
+      for (const ch of ['email', 'push', 'ntfy']) {
+        if (typeof notify_matrix[type][ch] !== 'undefined') {
+          existing[type][ch] = !!notify_matrix[type][ch];
+        }
+      }
+    }
+    matrixToSave = JSON.stringify(existing);
+  }
+
+  dbRun('UPDATE users SET notify_email=?,notify_push=?,notify_match=?,notify_new=?,notify_digest_interval=?,ntfy_topic=?,ntfy_server=?,notify_threshold=?,notify_matrix=? WHERE id=?', [
     notify_email ? 1 : 0, notify_push ? 1 : 0,
     notify_match ? 1 : 0, notify_new  ? 1 : 0,
     interval,
     (ntfy_topic || '').trim().substring(0, 200),
     (ntfy_server || '').trim().substring(0, 200),
     threshold,
+    matrixToSave,
     req.session.userId,
   ]);
   saveDb();
-  res.json({ success: true });
+  res.json({ success: true, notify_matrix: getNotifyMatrix({ notify_matrix: matrixToSave }) });
 });
 
 // ── Web Push ───────────────────────────────────────────────
@@ -427,17 +537,23 @@ app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
 // ── Push sender helper ─────────────────────────────────────
 async function sendPushToUser(userId, payload) {
   const subs = dbAll('SELECT * FROM push_subscriptions WHERE user_id=?', [userId]);
+  if (!subs.length) {
+    console.log(`[Push] Nutzer ${userId} hat keine aktive Browser-Push-Subscription (nie aktiviert oder abgelaufen)`);
+    return;
+  }
   for (const sub of subs) {
     try {
       await webpush.sendNotification(
         { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
         JSON.stringify(payload)
       );
+      console.log(`[Push] Gesendet an Nutzer ${userId}`);
     } catch (e) {
       if (e.statusCode === 410 || e.statusCode === 404) {
         // Subscription expired – remove it
         dbRun('DELETE FROM push_subscriptions WHERE id=?', [sub.id]);
         saveDb();
+        console.warn(`[Push] Subscription für Nutzer ${userId} abgelaufen (HTTP ${e.statusCode}), entfernt`);
       } else {
         console.warn(`[Push] Fehler für user ${userId}:`, e.message);
       }
@@ -465,12 +581,12 @@ async function checkAndNotifyMatch(listingId, groupId) {
   console.log(`[Notify] Match! Gruppe "${group.name}" für Inserat "${listing.title}"`);
 
   for (const uid of memberIds) {
-    const user = dbGet('SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,ntfy_topic,ntfy_server,unsubscribe_token FROM users WHERE id=?', [uid]);
-    if (!user || !user.notify_match) continue;
+    const user = dbGet('SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,ntfy_topic,ntfy_server,notify_matrix,unsubscribe_token FROM users WHERE id=?', [uid]);
+    if (!user) continue;
 
     // Matches are always delivered immediately regardless of digest setting
     // (matches are rare and time-sensitive)
-    if (user.notify_push) {
+    if (shouldNotify(user, 'match', 'push')) {
       await sendPushToUser(uid, {
         title: `🎉 Match in "${group.name}"!`,
         body:  listing.title.substring(0, 80),
@@ -478,10 +594,10 @@ async function checkAndNotifyMatch(listingId, groupId) {
         icon:  '/icon-192.png',
       });
     }
-    if (user.ntfy_topic) {
+    if (shouldNotify(user, 'match', 'ntfy')) {
       await sendNtfy(user, `🎉 Match in "${group.name}"!`, listing.title.substring(0, 80), 'groups');
     }
-    if (user.notify_email) {
+    if (shouldNotify(user, 'match', 'email')) {
       await mailer.sendMatchMail(user.email, user.username, group.name, listing, user.unsubscribe_token || '');
     }
   }
@@ -489,69 +605,214 @@ async function checkAndNotifyMatch(listingId, groupId) {
 
 // ── Listings ───────────────────────────────────────────────
 app.post('/api/listings/add', requireAuth, async (req, res) => {
-  const { url } = req.body;
+  const { url, visibility, visibility_id } = req.body;
   if (!url) return res.status(400).json({ error: 'URL erforderlich' });
+
+  const vis   = ['global','private','group'].includes(visibility) ? visibility : 'global';
+  const visId = vis === 'group' ? (parseInt(visibility_id) || null) : null;
+  if (vis === 'group' && visId) {
+    const member = dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [visId, req.session.userId]);
+    if (!member) return res.status(403).json({ error: 'Nicht Mitglied dieser Gruppe' });
+  }
+
   let listing = dbGet('SELECT * FROM listings WHERE url=?', [url]);
   if (!listing) {
     const scraped = await scrapeListing(url);
-    const { id } = insertListing(scraped, req.session.userId);
+    const { id } = insertListing(scraped, req.session.userId, null, vis, visId);
     listing = dbGet('SELECT * FROM listings WHERE id=?', [id]);
   }
   saveDb();
   res.json({ success: true, listing });
 });
 
+// Listings found by a specific search agent
+app.get('/api/jobs/:id/listings', requireAuth, (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Suchagent nicht gefunden' });
+
+  const uid  = req.session.userId;
+  const user = dbGet('SELECT is_admin FROM users WHERE id=?', [uid]);
+
+  // Check the requester is allowed to see this job at all
+  const canSeeJob = user?.is_admin
+    || job.visibility === 'global'
+    || job.added_by === uid
+    || (job.visibility === 'group' && dbGet(
+         'SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [job.visibility_id, uid]
+       ));
+  if (!canSeeJob) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+
+  const listings = dbAll(`
+    SELECT l.*,
+      (SELECT action FROM swipes WHERE listing_id=l.id AND user_id=?) as my_swipe
+    FROM listings l
+    WHERE l.source_job_id = ?
+    ORDER BY l.added_at DESC
+  `, [uid, req.params.id]);
+  res.json({ listings, job });
+});
+
+// Listings manually added by the current user (not via a search agent)
+app.get('/api/listings/mine', requireAuth, (req, res) => {
+  const listings = dbAll(`
+    SELECT l.*,
+      (SELECT action FROM swipes WHERE listing_id=l.id AND user_id=?) as my_swipe
+    FROM listings l
+    WHERE l.added_by = ? AND l.source_job_id IS NULL
+    ORDER BY l.added_at DESC
+  `, [req.session.userId, req.session.userId]);
+  res.json({ listings });
+});
+
+// Change history for a listing (title/price/size/rooms edits detected by
+// the periodic re-check), shown in the detail view so it's clear whether
+// e.g. the price shown today is the one you originally liked.
+app.get('/api/listings/:id/changes', requireAuth, (req, res) => {
+  const changes = dbAll(
+    'SELECT field, old_value, new_value, changed_at FROM listing_changes WHERE listing_id=? ORDER BY changed_at DESC',
+    [req.params.id]
+  );
+  res.json({ changes });
+});
+
+// Change visibility of a manually-added listing (only the original adder may do this,
+// and only for listings that weren't found by a search agent).
+app.patch('/api/listings/:id/visibility', requireAuth, (req, res) => {
+  const { visibility, visibility_id } = req.body;
+  if (!['global','private','group'].includes(visibility))
+    return res.status(400).json({ error: 'Ungültige Sichtbarkeit' });
+
+  const listing = dbGet('SELECT * FROM listings WHERE id=?', [req.params.id]);
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  if (listing.source_job_id) return res.status(400).json({ error: 'Sichtbarkeit nur für manuell hinzugefügte Inserate änderbar' });
+  if (listing.added_by !== req.session.userId) return res.status(403).json({ error: 'Nur der ursprüngliche Ersteller kann die Sichtbarkeit ändern' });
+
+  const visId = visibility === 'group' ? (parseInt(visibility_id) || null) : null;
+  if (visibility === 'group' && visId) {
+    const member = dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [visId, req.session.userId]);
+    if (!member) return res.status(403).json({ error: 'Nicht Mitglied dieser Gruppe' });
+  }
+
+  dbRun('UPDATE listings SET visibility=?, visibility_id=? WHERE id=?', [visibility, visId, req.params.id]);
+  saveDb();
+  res.json({ success: true, visibility, visibility_id: visId });
+});
+
+// Reusable count of how many active, visible-to-this-user listings a given
+// user still has NOT swiped (like/dislike/superlike – 'skip' doesn't count
+// as done since skipped items resurface). Mirrors the exact visibility rules
+// used by GET /api/listings/swipe so the two never disagree.
+function countPendingSwipes(uid) {
+  return dbGet(`
+    SELECT COUNT(DISTINCT l.id) as c FROM listings l
+    LEFT JOIN search_jobs sj ON l.source_job_id = sj.id
+    WHERE l.status = 'active'
+    AND l.id NOT IN (SELECT listing_id FROM swipes WHERE user_id=? AND action != 'skip')
+    AND (
+      (l.source_job_id IS NULL AND (
+        COALESCE(l.visibility, 'global') = 'global'
+        OR (l.visibility = 'private' AND l.added_by = ?)
+        OR (l.visibility = 'group' AND l.visibility_id IN (
+              SELECT group_id FROM group_members WHERE user_id = ?
+            ))
+      ))
+      OR (l.source_job_id IS NOT NULL AND (
+        sj.visibility = 'global'
+        OR (sj.visibility = 'private' AND sj.added_by = ?)
+        OR (sj.visibility = 'group' AND sj.visibility_id IN (
+              SELECT group_id FROM group_members WHERE user_id = ?
+            ))
+      ))
+    )
+  `, [uid, uid, uid, uid, uid])?.c || 0;
+}
+
 app.get('/api/listings/swipe', requireAuth, (req, res) => {
   const uid = req.session.userId;
   // Listings are visible if:
-  //  (a) added manually by any user  (no job source → always global)
-  //  (b) added by a job with visibility='global'
-  //  (c) added by a job with visibility='private' AND added_by = this user
-  //  (d) added by a job with visibility='group'   AND user is member of that group
+  //  (a) added manually with visibility='global' (or older rows with no visibility set)
+  //  (b) added manually with visibility='private' AND added_by = this user
+  //  (c) added manually with visibility='group'   AND user is member of that group
+  //  (d) added by a job with visibility='global'
+  //  (e) added by a job with visibility='private' AND job owner = this user
+  //  (f) added by a job with visibility='group'   AND user is member of that group
   // Skipped listings ('skip' action) stay in the queue but are sorted to the end,
   // so they resurface after everything else has been swiped.
   const listings = dbAll(`
     SELECT DISTINCT l.*, sw.action as _skip_marker FROM listings l
     LEFT JOIN swipes sw ON sw.listing_id = l.id AND sw.user_id = ? AND sw.action = 'skip'
-    LEFT JOIN search_jobs j ON l.added_by = j.added_by AND j.id = (
-      SELECT id FROM search_jobs WHERE added_by = l.added_by
-        AND visibility != 'global' LIMIT 1
-    )
+    LEFT JOIN search_jobs sj ON l.source_job_id = sj.id
     WHERE l.status = 'active'
     AND l.id NOT IN (SELECT listing_id FROM swipes WHERE user_id=? AND action != 'skip')
     AND (
-      -- manually added or job is global (default)
-      l.id IN (
-        SELECT id FROM listings WHERE added_by IS NULL OR added_by = 0
-      )
-      OR l.id IN (
-        SELECT li.id FROM listings li
-        JOIN search_jobs sj ON li.added_by = sj.added_by
-        WHERE sj.visibility = 'global'
-      )
-      -- private: only the job owner
-      OR l.id IN (
-        SELECT li.id FROM listings li
-        JOIN search_jobs sj ON li.added_by = sj.added_by
-        WHERE sj.visibility = 'private' AND sj.added_by = ?
-      )
-      -- group: user must be member
-      OR l.id IN (
-        SELECT li.id FROM listings li
-        JOIN search_jobs sj ON li.added_by = sj.added_by
-        JOIN group_members gm ON gm.group_id = sj.visibility_id AND gm.user_id = ?
-        WHERE sj.visibility = 'group'
-      )
-      -- manually added by this user or no job restriction
-      OR l.added_by = ?
-      OR l.id NOT IN (
-        SELECT li.id FROM listings li
-        JOIN search_jobs sj ON li.added_by = sj.added_by
-        WHERE sj.visibility != 'global'
-      )
+      -- manually added listing (no source job) → check the listing's own visibility
+      (l.source_job_id IS NULL AND (
+        COALESCE(l.visibility, 'global') = 'global'
+        OR (l.visibility = 'private' AND l.added_by = ?)
+        OR (l.visibility = 'group' AND l.visibility_id IN (
+              SELECT group_id FROM group_members WHERE user_id = ?
+            ))
+      ))
+      -- job-sourced listing → check the job's visibility
+      OR (l.source_job_id IS NOT NULL AND (
+        sj.visibility = 'global'
+        OR (sj.visibility = 'private' AND sj.added_by = ?)
+        OR (sj.visibility = 'group' AND sj.visibility_id IN (
+              SELECT group_id FROM group_members WHERE user_id = ?
+            ))
+      ))
     )
-    ORDER BY (CASE WHEN sw.action = 'skip' THEN 1 ELSE 0 END), l.added_at DESC
-  `, [uid, uid, uid, uid, uid]);
+  `, [uid, uid, uid, uid, uid, uid]);
+
+  // ── Group-priority sort ──────────────────────────────────
+  // Bring listings other group members already reacted to towards the
+  // front, so a "does anyone else like this?" signal surfaces early:
+  //   0) superliked by another group member
+  //   1) liked by another group member
+  //   2) no group signal yet (default) — newest first
+  //   3) disliked by another group member (deprioritized, but not hidden —
+  //      you might still disagree with your groupmates)
+  // Users with no groups simply get tier 2 for everything, which reduces
+  // to the previous "newest first" behaviour unchanged.
+  const otherMemberIds = dbAll(`
+    SELECT DISTINCT gm2.user_id FROM group_members gm1
+    JOIN group_members gm2 ON gm2.group_id = gm1.group_id AND gm2.user_id != gm1.user_id
+    WHERE gm1.user_id = ?
+  `, [uid]).map(r => r.user_id);
+
+  let groupSignalByListing = {};
+  if (otherMemberIds.length && listings.length) {
+    const memberPh  = otherMemberIds.map(() => '?').join(',');
+    const listingPh = listings.map(() => '?').join(',');
+    const signals = dbAll(`
+      SELECT listing_id, action FROM swipes
+      WHERE user_id IN (${memberPh}) AND listing_id IN (${listingPh}) AND action IN ('like','superlike','dislike')
+    `, [...otherMemberIds, ...listings.map(l => l.id)]);
+    for (const s of signals) {
+      const cur = groupSignalByListing[s.listing_id];
+      // A listing keeps its BEST signal if groupmates disagree (any
+      // superlike beats any like, which beats an all-dislike signal).
+      const rank = { superlike: 0, like: 1, dislike: 2 }[s.action];
+      if (cur === undefined || rank < cur) groupSignalByListing[s.listing_id] = rank;
+    }
+  }
+  const tierOf = (listing) => {
+    const sig = groupSignalByListing[listing.id];
+    if (sig === 0) return 0; // superliked by groupmate
+    if (sig === 1) return 1; // liked by groupmate
+    if (sig === 2) return 3; // disliked by groupmate
+    return 2;                // no group signal — "neuste Inserate"
+  };
+
+  listings.sort((a, b) => {
+    const skipA = a._skip_marker === 'skip' ? 1 : 0;
+    const skipB = b._skip_marker === 'skip' ? 1 : 0;
+    if (skipA !== skipB) return skipA - skipB;
+    const tierA = tierOf(a), tierB = tierOf(b);
+    if (tierA !== tierB) return tierA - tierB;
+    return new Date(b.added_at + 'Z') - new Date(a.added_at + 'Z');
+  });
+
   res.json({ listings });
 });
 
@@ -631,6 +892,25 @@ app.get('/api/listings/liked', requireAuth, (req, res) => {
       [req.session.userId]);
   }
   res.json({ listings: liked || [] });
+});
+
+// Fetch a single listing by ID for the share feature — any logged-in user
+// can open a listing they were sent a direct link to, regardless of the
+// normal group/private visibility rules that govern the swipe queue.
+// Visibility there exists to keep feeds relevant, not as a privacy
+// boundary on apartment listing data, so an explicit share link
+// intentionally overrides it (same idea as "anyone with the link").
+// Registered AFTER all the more specific literal /api/listings/... routes
+// above (swipe, rated, liked, mine) so this :id wildcard doesn't shadow them.
+app.get('/api/listings/:id', requireAuth, (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  const listing = dbGet(
+    `SELECT l.*, (SELECT action FROM swipes WHERE listing_id=l.id AND user_id=?) as my_swipe
+     FROM listings l WHERE l.id=?`,
+    [req.session.userId, req.params.id]
+  );
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  res.json({ listing });
 });
 
 // ── Archive ───────────────────────────────────────────────
@@ -746,7 +1026,63 @@ app.get('/api/groups/:id/members', requireAuth, (req, res) => {
   `, [req.params.id]) });
 });
 
-// Group results with consensus tiers
+// Member swipe status – how many listings each member still has to swipe
+app.get('/api/groups/:id/swipe-status', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, req.session.userId]))
+    return res.status(403).json({ error: 'Kein Zugriff' });
+
+  const members = dbAll(`
+    SELECT u.id, u.username FROM users u
+    JOIN group_members gm ON u.id=gm.user_id WHERE gm.group_id=?
+  `, [gid]);
+
+  // Each member has their own visible set of listings (based on visibility
+  // rules), so "pending" must be computed per member individually rather
+  // than against one global count of all active listings.
+  const status = members.map(m => {
+    const pending = countPendingSwipes(m.id);
+    const swiped  = dbGet('SELECT COUNT(*) as c FROM swipes WHERE user_id=? AND action != ?', [m.id, 'skip'])?.c || 0;
+    return { id: m.id, username: m.username, swiped, pending };
+  });
+  res.json({ status });
+});
+
+// Nudge a group member to swipe (sends push + queues notification)
+app.post('/api/groups/:id/nudge/:userId', requireAuth, async (req, res) => {
+  const gid    = req.params.id;
+  const target = parseInt(req.params.userId);
+  const sender = dbGet('SELECT * FROM users WHERE id=?', [req.session.userId]);
+
+  if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, req.session.userId]))
+    return res.status(403).json({ error: 'Kein Zugriff' });
+  if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, target]))
+    return res.status(404).json({ error: 'Nutzer nicht in dieser Gruppe' });
+  if (target === req.session.userId)
+    return res.status(400).json({ error: 'Du kannst dich nicht selbst nudgen' });
+
+  const group      = dbGet('SELECT * FROM groups_table WHERE id=?', [gid]);
+  const targetUser = dbGet('SELECT * FROM users WHERE id=?', [target]);
+  if (!targetUser || !group) return res.status(404).json({ error: 'Nicht gefunden' });
+
+  const nudgeTitle = `${sender?.username || 'Jemand'} erinnert dich ans Swipen!`;
+  const nudgeBody  = `Gruppe: ${group.name}`;
+
+  if (shouldNotify(targetUser, 'nudge', 'push')) {
+    await sendPushToUser(target, { title: nudgeTitle, body: nudgeBody, url: '/', icon: '/icon-192.png' });
+  }
+  if (shouldNotify(targetUser, 'nudge', 'ntfy')) {
+    await sendNtfy(targetUser, nudgeTitle, nudgeBody);
+  }
+  if (shouldNotify(targetUser, 'nudge', 'email')) {
+    await mailer.sendNudgeMail(targetUser.email, targetUser.username, sender?.username || 'Jemand', group.name, targetUser.unsubscribe_token || '');
+  }
+
+  console.log(`[Nudge] ${sender?.username} → ${targetUser.username} in "${group.name}"`);
+  res.json({ success: true });
+});
+
+
 app.get('/api/groups/:id/results', requireAuth, (req, res) => {
   const gid = req.params.id;
   if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, req.session.userId]))
@@ -900,6 +1236,66 @@ app.post('/api/jobs/:id/run', requireAuth, async (req, res) => {
   runJob(job);
 });
 
+// Deletes every listing this job previously found (and anything hanging
+// off those listings: swipes, contacts, archive notes) so the next poll
+// treats every URL as brand new and re-scrapes it from scratch with the
+// current scraper logic. Useful after a scraper bug fix, to flush out
+// old listings that were saved with incorrect/garbled data.
+function resetJobListings(jobId) {
+  const ids = dbAll('SELECT id FROM listings WHERE source_job_id=?', [jobId]).map(r => r.id);
+  if (!ids.length) return 0;
+  const placeholders = ids.map(() => '?').join(',');
+  dbRun(`DELETE FROM swipes          WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM contacts        WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM archive_notes   WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM listing_changes WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM listings        WHERE id IN (${placeholders})`, ids);
+  dbRun('UPDATE search_jobs SET last_run=NULL, last_error=NULL, last_new=0, total_found=0 WHERE id=?', [jobId]);
+  return ids.length;
+}
+
+function canManageJob(job, user) {
+  return !!user?.is_admin || job.added_by === user?.id;
+}
+
+app.post('/api/jobs/:id/reset', requireAuth, async (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+
+  const removed = resetJobListings(job.id);
+  saveDb();
+  res.json({ success: true, removed, message: `${removed} Inserate entfernt, Suchagent wird neu gescannt…` });
+
+  const freshJob = dbGet('SELECT * FROM search_jobs WHERE id=?', [job.id]);
+  runJob(freshJob);
+});
+
+app.post('/api/jobs/reset-all', requireAuth, async (req, res) => {
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  const jobs = user?.is_admin
+    ? dbAll('SELECT * FROM search_jobs')
+    : dbAll('SELECT * FROM search_jobs WHERE added_by=?', [user.id]);
+
+  if (!jobs.length) return res.json({ success: true, jobCount: 0, removed: 0 });
+
+  let totalRemoved = 0;
+  for (const job of jobs) totalRemoved += resetJobListings(job.id);
+  saveDb();
+  res.json({ success: true, jobCount: jobs.length, removed: totalRemoved,
+    message: `${jobs.length} Suchagenten zurückgesetzt, ${totalRemoved} Inserate entfernt.` });
+
+  // Re-run each job in the background, spaced slightly apart so they don't
+  // all hammer external sites in the exact same instant.
+  jobs.forEach((job, i) => {
+    setTimeout(() => {
+      const freshJob = dbGet('SELECT * FROM search_jobs WHERE id=?', [job.id]);
+      if (freshJob) runJob(freshJob);
+    }, i * 2000);
+  });
+});
+
 // ── Job runner ─────────────────────────────────────────────
 async function runJob(job) {
   console.log(`[Poller] Job: ${job.label}`);
@@ -907,7 +1303,7 @@ async function runJob(job) {
     const { newCount, totalFound } = await pollSearchJob(
       job,
       (url) => !!dbGet('SELECT id FROM listings WHERE url=?', [url]),
-      (data) => { insertListing(data, job.added_by); }
+      (data) => { insertListing(data, job.added_by, job.id); }
     );
     dbRun(`UPDATE search_jobs SET last_run=datetime('now'),last_error=NULL,last_new=?,total_found=total_found+? WHERE id=?`,
       [newCount, newCount, job.id]);
@@ -915,19 +1311,23 @@ async function runJob(job) {
     console.log(`[Poller] ${job.label}: ${newCount} neue (${totalFound} auf Seite)`);
 
     // Queue notifications – only for users who can see this job's listings
+    // AND have at least one channel enabled for "new listings" in their matrix
     if (newCount > 0) {
-      let eligibleUsers = [];
+      let candidateUsers = [];
       if (job.visibility === 'global') {
-        eligibleUsers = dbAll('SELECT * FROM users WHERE notify_new=1');
+        candidateUsers = dbAll('SELECT * FROM users');
       } else if (job.visibility === 'private') {
-        eligibleUsers = dbAll('SELECT * FROM users WHERE id=? AND notify_new=1', [job.added_by]);
+        candidateUsers = dbAll('SELECT * FROM users WHERE id=?', [job.added_by]);
       } else if (job.visibility === 'group' && job.visibility_id) {
-        eligibleUsers = dbAll(`
+        candidateUsers = dbAll(`
           SELECT u.* FROM users u
           JOIN group_members gm ON gm.user_id = u.id AND gm.group_id = ?
-          WHERE u.notify_new = 1
         `, [job.visibility_id]);
       }
+      const eligibleUsers = candidateUsers.filter(u => {
+        const m = getNotifyMatrix(u).new;
+        return m.email || m.push || m.ntfy;
+      });
 
       for (const user of eligibleUsers) {
         dbRun(
@@ -950,20 +1350,74 @@ async function runJob(job) {
   }
 }
 
+// Notify users who liked/superliked a listing about something relevant
+// happening to it (price change, now reserved, etc.) — sent immediately
+// via push/ntfy, similar to match notifications, since these are rare,
+// high-value, time-sensitive events rather than a routine digest item.
+async function notifyListingWatchers(listingId, title, body) {
+  const watchers = dbAll(`
+    SELECT u.id, u.username, u.email, u.notify_push, u.notify_matrix, u.ntfy_topic, u.ntfy_server, u.unsubscribe_token
+    FROM users u
+    JOIN swipes s ON s.user_id = u.id AND s.listing_id = ? AND s.action IN ('like','superlike')
+  `, [listingId]);
+  for (const w of watchers) {
+    if (shouldNotify(w, 'change', 'push'))  await sendPushToUser(w.id, { title, body, url: '/', icon: '/icon-192.png' });
+    if (shouldNotify(w, 'change', 'ntfy'))  await sendNtfy(w, title, body);
+    if (shouldNotify(w, 'change', 'email')) await mailer.sendListingChangeMail(w.email, w.username, title, body, w.unsubscribe_token || '');
+  }
+}
+
+const CHANGE_FIELD_LABELS = {
+  title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer',
+};
+
 // ── Status checker (runs every 6h) ────────────────────────
+// Re-scrapes every active listing to catch two kinds of updates:
+//  1) status flips (now offline/reserved) — archives + notifies watchers
+//  2) field changes (title/price/size/rooms edited by the landlord) —
+//     recorded in listing_changes for the detail view's history, and
+//     watchers get notified about price drops or a title rewrite.
 async function runStatusCheck() {
-  const listings = dbAll("SELECT id,url,platform FROM listings WHERE status='active'");
+  const listings = dbAll("SELECT id,url,platform,title,price,price_cold,size,rooms FROM listings WHERE status='active'");
   if (!listings.length) return;
   console.log(`[Status] Prüfe ${listings.length} aktive Inserate…`);
-  const { offline, reserved } = await checkExistingListings(listings, (id, status) => {
-    dbRun("UPDATE listings SET status=? WHERE id=?", [status, id]);
-    if (status === 'offline') {
-      try { dbRun("INSERT OR IGNORE INTO archive_notes (listing_id,reason) VALUES (?,?)", [id, 'offline']); } catch(_){}
+
+  const { offline, reserved, changed } = await checkExistingListings(
+    listings,
+    (id, status) => {
+      dbRun("UPDATE listings SET status=? WHERE id=?", [status, id]);
+      if (status === 'offline') {
+        try { dbRun("INSERT OR IGNORE INTO archive_notes (listing_id,reason) VALUES (?,?)", [id, 'offline']); } catch(_){}
+      }
+      saveDb();
+      console.log(`[Status] Inserat ${id} → ${status}`);
+      const listing = dbGet('SELECT title FROM listings WHERE id=?', [id]);
+      const label = status === 'reserved' ? 'jetzt reserviert' : 'jetzt offline';
+      notifyListingWatchers(id, `📌 Inserat ${label}`, listing?.title || '').catch(() => {});
+    },
+    (id, fieldChanges, fresh) => {
+      for (const { field, oldVal, newVal } of fieldChanges) {
+        dbRun('INSERT INTO listing_changes (listing_id,field,old_value,new_value) VALUES (?,?,?,?)',
+          [id, field, oldVal, newVal]);
+      }
+      const setClauses = fieldChanges.map(c => `${c.field}=?`).join(', ');
+      dbRun(`UPDATE listings SET ${setClauses} WHERE id=?`, [...fieldChanges.map(c => c.newVal), id]);
+      saveDb();
+      console.log(`[Status] Inserat ${id} geändert: ${fieldChanges.map(c => c.field).join(', ')}`);
+
+      // Only nudge watchers for the changes people actually care about —
+      // a price drop or a rewritten title, not every minor field tweak.
+      const priceChange = fieldChanges.find(c => c.field === 'price' || c.field === 'price_cold');
+      const titleChange = fieldChanges.find(c => c.field === 'title');
+      if (priceChange) {
+        const label = CHANGE_FIELD_LABELS[priceChange.field];
+        notifyListingWatchers(id, `💶 ${label} geändert`, `${fresh.title || ''}: ${priceChange.oldVal} → ${priceChange.newVal}`).catch(() => {});
+      } else if (titleChange) {
+        notifyListingWatchers(id, '✏️ Titel geändert', `${titleChange.oldVal} → ${titleChange.newVal}`).catch(() => {});
+      }
     }
-    saveDb();
-    console.log(`[Status] Inserat ${id} → ${status}`);
-  });
-  console.log(`[Status] ${offline||0} offline, ${reserved||0} reserviert`);
+  );
+  console.log(`[Status] ${offline||0} offline, ${reserved||0} reserviert, ${changed||0} geändert`);
 }
 
 // ── ntfy helper ───────────────────────────────────────────
@@ -1004,7 +1458,7 @@ async function sendNtfy(user, title, body, view = '') {
   const tags      = extractNtfyTags(title + ' ' + body);
 
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method:  'POST',
       headers: {
         'Title':         safeTitle,
@@ -1015,6 +1469,16 @@ async function sendNtfy(user, title, body, view = '') {
       body: safeBody,
       timeout: 8000,
     });
+    // fetch() only rejects on network-level failures (DNS, connection
+    // refused, timeout) — it does NOT throw on HTTP error responses like
+    // 403/500, so without this check a blocked/misconfigured/unreachable
+    // ntfy server would silently be logged as "sent" even though nothing
+    // was ever delivered.
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.warn(`[ntfy] Failed for user ${user.id} (HTTP ${res.status} ${res.statusText}): ${errBody.substring(0, 200)}`);
+      return;
+    }
     console.log(`[ntfy] Sent to ${user.ntfy_topic}: ${safeTitle}`);
   } catch (e) {
     console.warn(`[ntfy] Failed for user ${user.id}: ${e.message}`);
@@ -1026,8 +1490,8 @@ async function sendNtfy(user, title, body, view = '') {
 // Flushes queued notifications for users whose digest_interval matches
 async function flushNotificationQueue(intervalKey) {
   const users = intervalKey === 'all'
-    ? dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,ntfy_topic,ntfy_server,unsubscribe_token FROM users")
-    : dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,ntfy_topic,ntfy_server,unsubscribe_token FROM users WHERE notify_digest_interval=?", [intervalKey]);
+    ? dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,notify_matrix,ntfy_topic,ntfy_server,unsubscribe_token FROM users")
+    : dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,notify_matrix,ntfy_topic,ntfy_server,unsubscribe_token FROM users WHERE notify_digest_interval=?", [intervalKey]);
 
   for (const user of users) {
     const items = dbAll(
@@ -1069,15 +1533,15 @@ async function flushNotificationQueue(intervalKey) {
 
     if (pushTitle && (newListingItems.length || otherItems.length)) {
       // Browser push
-      if (user.notify_push) {
+      if (shouldNotify(user, 'new', 'push')) {
         await sendPushToUser(user.id, { title: pushTitle, body: pushBody, url: '/', icon: '/icon-192.png' });
       }
       // ntfy
-      if (user.ntfy_topic) {
+      if (shouldNotify(user, 'new', 'ntfy')) {
         await sendNtfy(user, pushTitle, pushBody);
       }
       // Email – only send digest email if there are enough items to justify it
-      if (user.notify_email && user.notify_new) {
+      if (shouldNotify(user, 'new', 'email')) {
         const totalCount = newListingItems.reduce((s, i) => {
           return s + parseInt(i.title.match(/\d+/)?.[0] || '0');
         }, 0);
@@ -1159,6 +1623,44 @@ app.get('/api/admin/users', requireAuth, (req, res) => {
   if (!me?.is_admin) return res.status(403).json({ error: 'Kein Zugriff' });
   const users = dbAll('SELECT id,username,email,is_admin,created_at FROM users ORDER BY created_at ASC');
   res.json({ users });
+});
+
+// ── Email unsubscribe (no auth – token-based) ────────────────────────────────
+app.get('/api/notify/unsubscribe-email', (req, res) => {
+  const { token } = req.query;
+  if (!token) {
+    return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+    <title>Abmelden – WohnungsSwipe</title>
+    <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+    h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
+    </head><body><div class="box"><h2>Ungültiger Link</h2><p>Dieser Abmelde-Link ist nicht gültig oder bereits abgelaufen.</p></div></body></html>`);
+  }
+
+  const user = dbGet('SELECT * FROM users WHERE unsubscribe_token=?', [token]);
+  if (!user) {
+    return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+    <title>Abmelden – WohnungsSwipe</title>
+    <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+    h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
+    </head><body><div class="box"><h2>Link ungültig</h2><p>Dieser Link ist nicht mehr gültig. Du kannst Benachrichtigungen auch direkt im Profil deaktivieren.</p></div></body></html>`);
+  }
+
+  dbRun('UPDATE users SET notify_email=0 WHERE id=?', [user.id]);
+  saveDb();
+
+  res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+  <title>Abgemeldet – WohnungsSwipe</title>
+  <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+  .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+  h2{color:#5bdc8a;margin-bottom:12px}p{color:#9b9896;font-size:.9rem;line-height:1.6}
+  a{color:#e8c97a}</style>
+  </head><body><div class="box">
+  <h2>✓ Abgemeldet</h2>
+  <p>Du erhältst keine E-Mail-Benachrichtigungen mehr von WohnungsSwipe.</p>
+  <p style="margin-top:16px"><a href="${process.env.BASE_URL || 'http://localhost:3000'}">Zurück zur App →</a></p>
+  </div></body></html>`);
 });
 
 // ── Password reset page ────────────────────────────────────

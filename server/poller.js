@@ -26,12 +26,16 @@ function detectPlatform(url) {
   if (url.includes('kleinanzeigen.de'))     return 'kleinanzeigen';
   if (url.includes('immobilienscout24.de')) return 'immoscout';
   if (url.includes('immowelt.de'))          return 'immowelt';
+  if (url.includes('rentola.de'))           return 'rentola';
+  if (url.includes('meinestadt.de'))        return 'meinestadt';
   return 'unbekannt';
 }
 
-async function fetchPage(url, timeoutMs = 18000) {
+async function fetchPage(url, timeoutMs = 18000, allowedFailCodes = []) {
   const res = await fetch(url, { headers: HEADERS, timeout: timeoutMs });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok && !allowedFailCodes.includes(res.status)) {
+    throw new Error(`HTTP ${res.status}`);
+  }
   return res.text();
 }
 
@@ -58,6 +62,18 @@ function extractListingUrls(html, searchUrl) {
       let href = $(el).attr('href') || '';
       if (href.startsWith('/')) href = 'https://www.immowelt.de' + href;
       if (href.startsWith('http')) urls.add(href.split('?')[0]);
+    });
+  } else if (platform === 'rentola') {
+    $('a[href*="/listings/"]').each((_, el) => {
+      let href = $(el).attr('href') || '';
+      if (href.startsWith('/')) href = 'https://rentola.de' + href;
+      if (href.startsWith('http') && href.includes('/listings/')) urls.add(href.split('?')[0]);
+    });
+  } else if (platform === 'meinestadt') {
+    $('a[href*="/expose/"]').each((_, el) => {
+      let href = $(el).attr('href') || '';
+      if (href.startsWith('/')) href = 'https://www.meinestadt.de' + href;
+      if (href.startsWith('http') && href.includes('/expose/')) urls.add(href.split('?')[0]);
     });
   } else {
     $('a[href]').each((_, el) => {
@@ -95,6 +111,84 @@ function findKaltmiete($, descText) {
   return '';
 }
 
+// ── Robust price extraction for listing pages ──────────────
+// Kleinanzeigen (especially corporate/property-management listings like
+// Vonovia) often show the main rent as a short standalone heading right
+// under the title (e.g. "490 €") rather than inside any consistently
+// class-named price element — CSS selectors for this drift often enough
+// that we fall back to a structural pattern instead: any heading-ish
+// element whose ENTIRE text content is just a euro amount and nothing
+// else is almost certainly the listing's price.
+function findStandalonePriceHeading($) {
+  let found = '';
+  $('h1, h2, h3, strong, b, [class*="price" i]').each((_, el) => {
+    if (found) return;
+    const t = $(el).text().trim();
+    if (/^\d[\d.,]*\s*€$/.test(t)) found = t;
+  });
+  return found;
+}
+
+// Extract labeled cost/meta fields (Warmmiete, Nebenkosten, Heizkosten,
+// Kaution, Wohnungstyp, Verfügbar ab) plus core facts (Wohnfläche, Zimmer,
+// Schlafzimmer, Badezimmer, Etage) directly from the page's visible text.
+// This sidesteps brittle CSS selectors entirely: as long as the label word
+// appears somewhere near its value (true for every Kleinanzeigen layout
+// variant we've observed — including newer listings that render this as a
+// bare "Label Value" list with no wrapping class our old selectors knew
+// about), the regex finds it regardless of markup.
+function extractKleinanzeigenCostFields($, visibleText) {
+  const out = {};
+  const grab = (re) => { const m = visibleText.match(re); return m ? m[1].trim() : ''; };
+  out.price_warm      = grab(/Warmmiete\s*([\d.,]+\s*€)/i);
+  out.nebenkosten      = grab(/Nebenkosten\s*([\d.,]+\s*€)/i);
+  out.heizkosten        = grab(/Heizkosten\s*([\d.,]+\s*€)/i);
+  out.kaution           = grab(/Kaution(?:\s*\/\s*Genoss\.?-?Anteile)?\s*[:\s]*([\d.,]+\s*€)/i);
+  // "Verfügbar ab" appears either as a numeric date ("08.09.26") or a
+  // textual month + year ("September 2026") depending on listing type.
+  out.available_from    = grab(/Verfügbar ab:?\s*([\d.,\/]+|[A-ZÄÖÜ][a-zäöüß]+\s+\d{4})/i);
+  out.property_type     = grab(/Wohnungstyp\s+([A-ZÄÖÜ][A-Za-zäöüßÄÖÜ]+)/);
+  // Core facts — fallback source for d.size/d.rooms when the old
+  // selector-based extraction (which depends on specific CSS classes that
+  // have proven unreliable across listing types) comes up empty.
+  out.wohnflaeche        = grab(/Wohnfläche\s+([\d.,]+\s*m[²2])/i);
+  out.zimmer_count       = grab(/\bZimmer\s+(\d+(?:,\d+)?)\b/);
+  out.schlafzimmer       = grab(/Schlafzimmer\s+(\d+)\b/i);
+  out.badezimmer         = grab(/Badezimmer\s+(\d+)\b/i);
+  out.etage              = grab(/\bEtage\s+(\d+|EG|UG)\b/i);
+  return out;
+}
+
+// ── Ausstattung (amenities) extraction ─────────────────────
+// Kleinanzeigen renders a dedicated "Ausstattung" heading followed by a
+// semicolon-separated list of real amenities. Reading FROM that heading
+// is far more reliable than broad class-based selectors, which can also
+// pick up unrelated page furniture: UI action buttons ("Nachricht
+// schreiben", "Zur Merkliste hinzufügen") and — critically — preview
+// cards from the "Andere Anzeigen des Anbieters" (other listings from
+// this seller) section at the bottom of the page, which contain their
+// OWN size/room/price badges that have nothing to do with this listing.
+function extractKleinanzeigenAusstattung($) {
+  const items = new Set();
+  $('h1, h2, h3, h4, dt, strong').each((_, el) => {
+    if (!/^ausstattung$/i.test($(el).text().trim())) return;
+    let sib = $(el).next();
+    let tries = 0;
+    while (sib.length && tries < 3) {
+      const txt = sib.text().trim();
+      if (txt.length > 10) {
+        txt.split(/[;\n]/).map(s => s.trim()).filter(Boolean).forEach(s => {
+          if (s.length > 1 && s.length < 60) items.add(s);
+        });
+        break;
+      }
+      sib = sib.next();
+      tries++;
+    }
+  });
+  return [...items];
+}
+
 function collectImages($, selectors) {
   const set = new Set();
   selectors.forEach(sel => {
@@ -107,22 +201,113 @@ function collectImages($, selectors) {
   return [...set];
 }
 
+// ── Strip content that belongs to OTHER listings ───────────
+// Kleinanzeigen shows a "Das könnte dich auch interessieren" (related
+// listings) carousel near the bottom of every ad page, and its preview
+// cards use the exact same CDN domain/URL pattern for their thumbnails as
+// the actual listing's own gallery photos — so a URL-pattern-based image
+// collector (or any other broad scan) can't tell them apart by URL alone.
+// This removes every link pointing to a DIFFERENT ad (identified by the
+// numeric ad ID embedded in Kleinanzeigen's own /s-anzeige/.../<id>-...
+// URL scheme) before any extraction runs, so related-listing photos,
+// prices, sizes, tags etc. can never leak into the data for THIS listing —
+// regardless of which specific field a future scraper change might read.
+function stripOtherListingsContent($, ownUrl) {
+  const ownIdMatch = (ownUrl || '').match(/(\d{6,})-\d+-\d+/);
+  const ownId = ownIdMatch ? ownIdMatch[1] : null;
+  if (!ownId) return;
+
+  $('a[href*="/s-anzeige/"]').each((_, a) => {
+    const href = $(a).attr('href') || '';
+    const m = href.match(/(\d{6,})-\d+-\d+/);
+    if (m && m[1] !== ownId) $(a).remove();
+  });
+}
+
+// ── Strip the seller's own "other listings" preview widget ─
+// Commercial/high-volume sellers (e.g. "Ohne Makler", property managers)
+// get a profile card showing a handful of thumbnail previews from their
+// OTHER active listings ("7584 Anzeigen online"), typically linking to
+// their /s-bestandsliste.html overview page rather than individual
+// /s-anzeige/ URLs — so stripOtherListingsContent()'s ad-ID matching
+// doesn't catch these, and they still use the same CDN image pattern as
+// this listing's own photos. "Anzeigen online" is a distinctive, stable
+// anchor phrase for this specific widget regardless of its exact markup.
+function stripSellerPreviewImages($) {
+  $('*').each((_, el) => {
+    const $el = $(el);
+    // Only match on the element's OWN direct text content (excluding text
+    // bubbled up from descendants) — otherwise .text() on broad ancestors
+    // like <body> ALSO contains "Anzeigen online" somewhere in their full
+    // subtree, causing the walk-up-and-remove logic below to sweep up
+    // images from completely unrelated parts of the page, including the
+    // listing's own real gallery.
+    const ownText = $el.contents().filter((_, n) => n.type === 'text').text();
+    if (!/anzeigen online/i.test(ownText)) return;
+
+    let container = $el;
+    for (let i = 0; i < 5 && container.length; i++) {
+      const imgs = container.find('img[src*="kleinanzeigen.de/api/v1/prod-ads/images/"]');
+      if (imgs.length) { imgs.remove(); break; }
+      container = container.parent();
+    }
+  });
+}
+
+// ── Kleinanzeigen-specific gallery extraction ──────────────
+// Kleinanzeigen's own CDN URLs don't carry a real file extension
+// (e.g. ".../images/8f/8f8d6d23-...?rule=$_59.AUTO"), so the generic
+// collectImages() extension filter silently drops every gallery photo
+// except whichever one happens to be duplicated via the og:image meta tag.
+// CSS class selectors for the gallery also tend to drift as Kleinanzeigen
+// updates its markup. Instead we match directly on the stable CDN URL
+// pattern (img.kleinanzeigen.de/api/v1/prod-ads/images/<id>), dedupe by
+// the image's unique ID (ignoring the `rule=` size variant), and always
+// request the larger "$_59" size for display quality.
+function collectKleinanzeigenGalleryImages($) {
+  const seen = new Map(); // imageId -> normalized large-size URL
+  $('img[src*="kleinanzeigen.de/api/v1/prod-ads/images/"], img[data-src*="kleinanzeigen.de/api/v1/prod-ads/images/"], img[data-imgsrc*="kleinanzeigen.de/api/v1/prod-ads/images/"]').each((_, el) => {
+    const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-imgsrc') || '';
+    const match = src.match(/\/images\/([a-f0-9]+)\/([a-f0-9-]+)/i);
+    if (!match) return;
+    const imageId  = match[2];
+    const largeUrl = src.replace(/rule=\$_\d+\.\w+/i, 'rule=$_59.AUTO');
+    if (!seen.has(imageId)) seen.set(imageId, largeUrl);
+  });
+  return [...seen.values()];
+}
+
+// Shared real-estate amenity keywords, mined from free-text where no
+// structured field exists. Word boundaries (applied at match time) prevent
+// e.g. "Dachgeschoss" from matching inside the unrelated compound word
+// "Dachgeschosswohnung" (seen in Kleinanzeigen's own footer navigation).
+const AMENITY_KEYWORDS = [
+  'Balkon','Terrasse','Garten','Keller','Aufzug','Fahrstuhl','Einbauküche','EBK',
+  'Parkett','Fußbodenheizung','Altbau','Neubau','Dachgeschoss','Erdgeschoss',
+  'WG-geeignet','Haustiere erlaubt','barrierefrei','möbliert','teilmöbliert',
+  'Tiefgarage','Stellplatz','Garage','Photovoltaik','Fernwärme','Gasheizung',
+  'Zentralheizung','Badewanne','Dusche','Wannenbad','Abstellraum','Kellerabteil',
+];
+
 // ── Extract tags/features from listing ───────────────────
 function extractTags($, platform, descText) {
   const tags = new Set();
 
   if (platform === 'kleinanzeigen') {
-    // Kleinanzeigen feature chips/attributes
-    $('[class*="tag"], [class*="Tag"], .iconlist li, [class*="feature"], [class*="Feature"]').each((_, el) => {
-      const t = $(el).text().trim();
-      if (t.length > 1 && t.length < 40 && !/^\d+$/.test(t)) tags.add(t);
-    });
-    // Also mine from the details list
-    $('.addetailslist--detail').each((_, el) => {
-      const lbl = $(el).find('.addetailslist--detail--label').text().trim();
-      const val = $(el).find('span:last-child').text().trim();
-      if (lbl && val && !/preis|miete|größe|zimmer/i.test(lbl)) tags.add(`${lbl}: ${val}`);
-    });
+    // Primary: read the real "Ausstattung" list directly (see helper above)
+    // — reliably scoped to just this listing's own amenities, unlike broad
+    // class selectors which also catch UI buttons and unrelated preview
+    // cards from the "Andere Anzeigen des Anbieters" section.
+    const ausstattung = extractKleinanzeigenAusstattung($);
+    ausstattung.forEach(t => tags.add(t));
+    // Deliberately NO generic DOM-selector fallback here anymore: broad
+    // selectors like [class*="tag"] repeatedly proved unreliable, pulling
+    // in seller trust badges ("TOP Zufriedenheit") and size/room figures
+    // from unrelated listings in the "Das könnte dich auch interessieren"
+    // carousel further down the page. When a listing has no proper
+    // Ausstattung heading, the description-keyword mining at the end of
+    // this function (scoped to this listing's own text) is the fallback —
+    // fewer tags but never wrong ones.
   } else if (platform === 'immoscout') {
     $('[class*="criteriaGroup"] [class*="criteria"], [data-qa*="criterion"]').each((_, el) => {
       const lbl = $(el).find('[class*="label"]').text().trim();
@@ -134,37 +319,96 @@ function extractTags($, platform, descText) {
       const t = $(el).text().trim();
       if (t && t.length < 50 && !/preis|miete|€/i.test(t)) tags.add(t);
     });
+  } else if (platform === 'rentola') {
+    $('[class*="feature"], [class*="Feature"], [class*="amenity"]').each((_, el) => {
+      const t = $(el).text().trim();
+      if (t.length > 2 && t.length < 40 && !/^\d+$/.test(t) && !/[€m²]/.test(t)) tags.add(t);
+    });
+  } else if (platform === 'meinestadt') {
+    const metaDesc = $('meta[name="description"]').attr('content') || '';
+    const ausstMatch = metaDesc.match(/Ausstattung:\s*(.+?)(?:\.|$)/i);
+    if (ausstMatch) {
+      ausstMatch[1].split(/[,/]/).forEach(tag => {
+        const t = tag.trim();
+        if (t.length > 1 && t.length < 40) tags.add(t);
+      });
+    }
   }
 
   // Mine common keywords from description
-  const keywords = [
-    'Balkon','Terrasse','Garten','Keller','Aufzug','Fahrstuhl','Einbauküche','EBK',
-    'Parkett','Fußbodenheizung','Altbau','Neubau','Dachgeschoss','Erdgeschoss',
-    'WG-geeignet','Haustiere erlaubt','barrierefrei','möbliert','teilmöbliert',
-    'Tiefgarage','Stellplatz','Garage','Photovoltaik','Fernwärme','Gasheizung',
-    'Zentralheizung','Badewanne','Dusche','Wannenbad','Abstellraum','Kellerabteil',
-  ];
-  keywords.forEach(kw => {
-    if (new RegExp(kw, 'i').test(descText)) tags.add(kw);
+  AMENITY_KEYWORDS.forEach(kw => {
+    if (new RegExp(`\\b${kw}\\b`, 'i').test(descText)) tags.add(kw);
   });
 
   return [...tags].slice(0, 12); // max 12 tags per listing
 }
 
+// ── Visible-text helper ────────────────────────────────────
+// Cheerio's .text() includes text inside <script>/<style>/<noscript> tags.
+// This is fine for normal server-rendered HTML, but JS-heavy SPA sites
+// (rentola, and similar Next.js-based platforms) embed the entire app's
+// state as JSON inside a <script> tag – including translation strings,
+// config, and data about OTHER listings shown elsewhere on the same page.
+// That embedded JSON can innocently contain phrases like "bereits vermietet"
+// or "nicht mehr verfügbar" (e.g. as a status label used somewhere in the
+// UI, or describing a *different* listing) that have nothing to do with
+// the actual listing being scraped. We strip script/style content first so
+// only genuinely rendered, visible text is used for status pattern-matching.
+function getVisibleText($, selector = 'body') {
+  const $clone = $(selector).clone();
+  $clone.find('script, style, noscript, template').remove();
+  return $clone.text();
+}
+
+// ── Paragraph-preserving text extraction ───────────────────
+// Cheerio's plain .text() concatenates every text node with no separator
+// between block-level elements, so a description with clear paragraphs in
+// the source HTML (<p>...</p><p>...</p> or lines separated by <br>) comes
+// out as one unbroken wall of text. We insert explicit newlines at block
+// boundaries BEFORE reading the text, so the paragraph structure a reader
+// actually sees on the original page survives into our stored description.
+function extractTextWithParagraphs($, el) {
+  if (!el || !el.length) return '';
+  const $clone = el.clone();
+  $clone.find('br').replaceWith('\n');
+  $clone.find('p, div, li').each((_, block) => { $(block).append('\n\n'); });
+  let text = $clone.text();
+
+  // Some listings (seen on professional/property-management accounts)
+  // ship their description with literal "<br />"-style characters baked
+  // in as plain TEXT rather than as real <br> DOM elements — likely from
+  // pasting a rich-text template into a plaintext-only field. Real <br>
+  // tags are already converted above; this catches the literal-text case
+  // too, so paragraphs still come through instead of showing as raw
+  // "&lt;br /&gt;" once the page escapes them for safe HTML display.
+  text = text.replace(/<br\s*\/?>/gi, '\n');
+
+  text = text.replace(/[ \t]+\n/g, '\n');   // trim trailing spaces before a break
+  text = text.replace(/\n{3,}/g, '\n\n');   // collapse 3+ blank lines to exactly one
+  return text.split('\n').map(l => l.trimEnd()).join('\n').trim();
+}
+
 // ── Check if listing is offline or reserved ───────────────
 function checkListingStatus($, platform) {
-  const bodyText = $('body').text().toLowerCase();
+  const bodyText = getVisibleText($, 'body').toLowerCase();
   const title    = $('title').text().toLowerCase();
 
   // Common offline indicators
   const offlinePatterns = [
     /nicht mehr aktiv/i, /anzeige.*nicht.*vorhanden/i, /bereits.*verkauft/i,
     /bereits.*vermietet/i, /diese anzeige.*existiert nicht/i,
-    /anzeige.*gelöscht/i, /404/i, /not found/i, /leider nicht mehr/i,
+    /anzeige.*gelöscht/i, /not found/i, /leider nicht mehr/i,
     /nicht mehr verfügbar/i, /angebot.*abgelaufen/i,
   ];
+  // Only match 404/not-found in the page title, not in the body
+  // (many active sites mention "not found" in navigation or error helpers)
+  const titleOfflinePatterns = [/404/i, /not found/i, /seite nicht gefunden/i];
+
   for (const p of offlinePatterns) {
     if (p.test(bodyText) || p.test(title)) return 'offline';
+  }
+  for (const p of titleOfflinePatterns) {
+    if (p.test(title)) return 'offline';
   }
 
   // Reserved indicators
@@ -179,14 +423,46 @@ function checkListingStatus($, platform) {
   if (platform === 'kleinanzeigen') {
     if ($('.adexpired, [data-testid="adexpired"], .banner--warning').length) return 'offline';
     if ($('[data-testid="reserved-badge"], .reserved-badge').length) return 'reserved';
-    // Check if title area exists – if not, likely 404/expired
-    if (!$('h1#viewad-title, h1.headline').length && bodyText.length < 5000) return 'offline';
+    // Only flag as offline if there's NO title AND the page is very small
+    // (avoids false positives on JS-heavy pages that just haven't loaded yet)
+    if (!$('h1#viewad-title, h1.headline').length && bodyText.length < 3000) return 'offline';
   }
   if (platform === 'immoscout') {
     if ($('[data-qa="expose-offline"], .expose--inactive').length) return 'offline';
   }
+  // rentola/meinestadt: no DOM-based checks (they're SPAs, real content loads
+  // client-side), but the generic text-pattern checks above now work reliably
+  // for them too, since script/style content no longer pollutes bodyText.
 
   return 'active';
+}
+
+// ── Geocoding fallback ──────────────────────────────────────
+// Not every platform embeds real coordinates like Kleinanzeigen does (e.g.
+// rentola only gives us a free-text address). For those, we ask
+// OpenStreetMap's free Nominatim geocoder to resolve the address to
+// lat/lng, so the detail view can still show a real embedded map instead
+// of just a text link. This runs at most once per newly-scraped listing,
+// well within Nominatim's usage policy (max ~1 req/s, identify via
+// User-Agent) since scraping already spaces out requests between listings.
+async function geocodeLocation(locationText) {
+  if (!locationText || !locationText.trim()) return null;
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(locationText.trim())}`,
+      { headers: { 'User-Agent': 'WohnungsSwipe/1.0 (self-hosted apartment search tool)' }, timeout: 8000 }
+    );
+    if (!res.ok) return null;
+    const results = await res.json();
+    if (!results.length) return null;
+    const lat = parseFloat(results[0].lat);
+    const lon = parseFloat(results[0].lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    return { lat, lon };
+  } catch (e) {
+    console.warn(`[Geocode] Fehler für "${locationText}": ${e.message}`);
+    return null;
+  }
 }
 
 // ── Scrape a single listing ───────────────────────────────
@@ -197,12 +473,18 @@ async function scrapeListing(url) {
     title: '', price: '', price_cold: '', size: '', location: '',
     rooms: '', image_url: '', images_json: '[]', description: '',
     tags_json: '[]', status: 'active',
+    nebenkosten: '', heizkosten: '', kaution: '', available_from: '', property_type: '',
+    latitude: null, longitude: null,
   };
 
   let html;
-  try { html = await fetchPage(url); }
+  try {
+    // For SPA platforms, allow 403 responses – they still contain meta tags in the HTML
+    const allowedCodes = (platform === 'rentola' || platform === 'meinestadt') ? [403] : [];
+    html = await fetchPage(url, 18000, allowedCodes);
+  }
   catch (e) {
-    // HTTP 404 / 410 = definitely offline
+    // HTTP 404 / 410 = definitely offline; 403 for non-SPA = likely offline
     if (e.message.includes('404') || e.message.includes('410') || e.message.includes('403')) {
       d.status = 'offline';
     }
@@ -212,13 +494,45 @@ async function scrapeListing(url) {
   }
 
   const $ = cheerio.load(html);
+
+  // Remove any content belonging to OTHER listings (e.g. the "Das könnte
+  // dich auch interessieren" carousel) before extracting anything at all,
+  // so it can never bleed into this listing's images, tags, or any other
+  // field — regardless of which specific selector might otherwise match it.
+  if (platform === 'kleinanzeigen') {
+    stripOtherListingsContent($, url);
+    stripSellerPreviewImages($);
+  }
   d.status = checkListingStatus($, platform);
 
   if (platform === 'kleinanzeigen') {
-    d.title       = $('h1#viewad-title').text().trim() || $('h1').first().text().trim();
-    d.price       = extractPrice($('[data-testid="price"]').text() || $('.priceintro').text() || $('strong.price-big').text());
-    d.location    = $('#viewad-locality').text().trim() || $('[data-testid="listing-location"]').text().trim();
-    d.description = ($('#viewad-description-text').text() || $('[data-testid="description"]').text()).trim().substring(0, 800);
+    // Extra at-a-glance facts (Schlafzimmer/Badezimmer/Etage) that don't
+    // have dedicated DB columns get surfaced as tags instead — collected
+    // below, merged into the final tag list further down.
+    var extraFactTags = [];
+
+    d.title = $('h1#viewad-title').text().trim() || $('h1').first().text().trim();
+
+    // Location: take only the FIRST match. Kleinanzeigen frequently renders
+    // a duplicate (mobile+desktop) copy of the same location text elsewhere
+    // on the page; concatenating every match produces a doubled string like
+    // "28237 Gröpelingen – Gröpelingen28237 Gröpelingen – Gröpelingen".
+    let loc = $('#viewad-locality').first().text().trim() || $('[data-testid="listing-location"]').first().text().trim();
+    // Defensive dedup: collapse "XY" into "X" whenever the string is
+    // literally two back-to-back copies of the same text, regardless of cause.
+    if (loc.length % 2 === 0) {
+      const half = loc.length / 2;
+      if (loc.slice(0, half) === loc.slice(half)) loc = loc.slice(0, half);
+    }
+    d.location = loc;
+
+    // Preserve paragraph breaks from the source page instead of collapsing
+    // the whole description into one unbroken wall of text.
+    const descEl = $('#viewad-description-text').length
+      ? $('#viewad-description-text')
+      : $('[data-testid="description"]');
+    d.description = extractTextWithParagraphs($, descEl).substring(0, 3000);
+
     $('#viewad-details .addetailslist--detail').each((_, el) => {
       const lbl = $(el).find('.addetailslist--detail--label').text().toLowerCase();
       const val = $(el).find('span:last-child').text().trim();
@@ -226,10 +540,72 @@ async function scrapeListing(url) {
       if (/fläche|größe/.test(lbl))     d.size       = val;
       if (/kalt|netto|grund/.test(lbl)) d.price_cold = extractPrice(val) || val;
     });
-    if (!d.price_cold) d.price_cold = findKaltmiete($, d.description);
-    const imgs = collectImages($, ['#viewad-image img', '.galleryimage-element img', '[class*="gallery"] img']);
-    const og   = $('meta[property="og:image"]').attr('content') || '';
-    if (og) imgs.unshift(og);
+
+    // Additional structured fields (Warmmiete, Nebenkosten, Heizkosten,
+    // Kaution, Wohnungstyp, Verfügbar ab, Wohnfläche, Zimmer, Schlafzimmer,
+    // Badezimmer, Etage) — text-pattern based, so they survive markup
+    // changes the same way the price fallback below does. This is also the
+    // ONLY source for newer listing layouts that render facts as a bare
+    // "Label Value" list with no class our old selector-based approach knew
+    // to look for (which is why d.size/d.rooms were sometimes ending up
+    // completely empty despite the data clearly being on the page).
+    const visibleBody = getVisibleText($, 'body');
+    const costFields   = extractKleinanzeigenCostFields($, visibleBody);
+    Object.assign(d, {
+      nebenkosten:    costFields.nebenkosten,
+      heizkosten:     costFields.heizkosten,
+      kaution:        costFields.kaution,
+      available_from: costFields.available_from,
+      property_type:  costFields.property_type,
+    });
+    if (!d.size)  d.size  = costFields.wohnflaeche;
+    if (!d.rooms) d.rooms = costFields.zimmer_count;
+
+    // Schlafzimmer/Badezimmer/Etage don't have dedicated DB columns, but
+    // they're useful at-a-glance facts, so surface them as extra tags.
+    if (costFields.schlafzimmer) extraFactTags.push(`${costFields.schlafzimmer} Schlafzimmer`);
+    if (costFields.badezimmer)   extraFactTags.push(`${costFields.badezimmer} Badezimmer`);
+    if (costFields.etage)        extraFactTags.push(`Etage ${costFields.etage}`);
+
+    // Some listings show their amenities as a bare, unlabeled list (no
+    // "Ausstattung" heading at all — just "Balkon / Terrasse / Einbauküche"
+    // sitting right after the cost figures), which extractKleinanzeigenAusstattung()
+    // can't find since it specifically looks for that heading. As a safety
+    // net, scan the already-cleaned page text (other listings already
+    // stripped above) for the same amenity keywords used elsewhere — word
+    // boundaries keep this safe from Kleinanzeigen's own footer category
+    // links ("Dachgeschosswohnung in Gröpelingen" etc. don't match
+    // "Dachgeschoss" as a whole word).
+    AMENITY_KEYWORDS.forEach(kw => {
+      if (new RegExp(`\\b${kw}\\b`, 'i').test(visibleBody)) extraFactTags.push(kw);
+    });
+
+    // price_cold: prefer the addetailslist label match above; otherwise the
+    // standalone price heading (common on corporate/property-management
+    // listings that show the base rent as a bare "490 €" under the title
+    // rather than in any consistently labeled element); otherwise the
+    // legacy description-text pattern fallback.
+    if (!d.price_cold) d.price_cold = findStandalonePriceHeading($) || findKaltmiete($, d.description);
+
+    // price (rendered as the "warm" figure whenever it differs from
+    // price_cold): prefer an explicit Warmmiete match; else fall back to
+    // the classic selector-based price extraction (still valid for
+    // simpler/older private listings); else mirror price_cold so at least
+    // one figure is always shown instead of "Preis nicht angegeben".
+    d.price = costFields.price_warm
+           || extractPrice($('[data-testid="price"]').text() || $('.priceintro').text() || $('strong.price-big').text())
+           || d.price_cold;
+
+    // Primary: match Kleinanzeigen's stable CDN URL pattern directly (robust
+    // against markup/class-name changes and doesn't get filtered out by
+    // extension checks, since these URLs carry no real file extension).
+    let imgs = collectKleinanzeigenGalleryImages($);
+    if (!imgs.length) {
+      // Fallback to the old selector-based approach in case the CDN pattern changes
+      imgs = collectImages($, ['#viewad-image img', '.galleryimage-element img', '[class*="gallery"] img']);
+    }
+    const og = $('meta[property="og:image"]').attr('content') || '';
+    if (og && !imgs.some(u => u.includes(og.split('?')[0]))) imgs.unshift(og);
     d.images_json = JSON.stringify([...new Set(imgs)]);
     d.image_url   = imgs[0] || '';
   }
@@ -260,10 +636,102 @@ async function scrapeListing(url) {
       if (/fläche/.test(lbl))    d.size       = extractSize(lbl)  || val;
       if (/kaltmiete/.test(lbl)) d.price_cold = extractPrice(val) || val;
     });
-    if (!d.price_cold) d.price_cold = findKaltmiete($, $('body').text().substring(0, 3000));
+    if (!d.price_cold) d.price_cold = findKaltmiete($, getVisibleText($, 'body').substring(0, 3000));
     const imgs = collectImages($, ['[class*="Gallery"] img', '[class*="gallery"] img', '[class*="Slider"] img']);
     d.images_json = JSON.stringify(imgs);
     d.image_url   = imgs[0] || $('meta[property="og:image"]').attr('content') || '';
+  }
+  else if (platform === 'rentola') {
+    // Rentola is a Next.js SPA – most content is client-rendered.
+    // The server delivers reliable data only via meta tags and the page title.
+    // Example title: "Wohnung (61.0 m²) zur Miete in Bremen (Alte Neustadt, Bremen, Germany) - rentola.de"
+    // Example meta-description: "Jetzt verfügbar: 61.0 m² Wohnung zur Langzeitmiete in Alte Neustadt, Bremen, Germany. Mietpreis: 452 €."
+    const ogTitle   = $('meta[property="og:title"]').attr('content') || '';
+    const pageTitle = $('title').text();
+    const metaDesc  = $('meta[name="description"]').attr('content') || '';
+
+    // Title: prefer h1 if rendered, fall back to og:title → page title
+    d.title = $('h1').first().text().trim() || ogTitle || pageTitle.replace(/ - rentola\.de$/i, '').trim();
+
+    // Rooms from og:title or page title: "3 Zimmer Wohnung mit 61m²"
+    d.rooms = extractRooms(ogTitle) || extractRooms(pageTitle) || extractRooms(metaDesc);
+
+    // Size from og:title, page title, or meta description
+    d.size  = extractSize(ogTitle) || extractSize(pageTitle) || extractSize(metaDesc);
+
+    // Price from meta description: "Mietpreis: 452 €"
+    const priceMatch = metaDesc.match(/Mietpreis:\s*(\d[\d.,]*\s*€)/i) ||
+                       metaDesc.match(/(\d[\d.,]*)\s*€/);
+    d.price      = priceMatch ? priceMatch[1].trim() : extractPrice(metaDesc);
+    d.price_cold = d.price; // rentola shows Kaltmiete directly
+
+    // Location from meta description: "in Alte Neustadt, Bremen, Germany"
+    // Strip the English country name at the end
+    const locMatch = metaDesc.match(/in\s+([^.]+,\s*[^.]+?)(?:\.|Mietpreis|$)/i) ||
+                     pageTitle.match(/in\s+([^(]+)\s*\(/i);
+    if (locMatch) {
+      d.location = locMatch[1].trim()
+        .replace(/,?\s*(Germany|Deutschland|Austria|Österreich|Switzerland|Schweiz)\s*$/i, '')
+        .trim();
+    }
+
+    // Description from meta description (remove price sentence at end)
+    d.description = metaDesc.replace(/Kontaktiere den Vermieter.*$/i, '').trim().substring(0, 800);
+
+    // Images: server-rendered img tags with rentola CDN
+    const imgs = collectImages($, [
+      'img[src*="img2.rentola.com"]',
+      'img[src*="rentola"]',
+      '[class*="gallery"] img',
+      '[class*="slider"] img',
+    ]);
+    const ogImg = $('meta[property="og:image"]').attr('content') || '';
+    if (ogImg && !imgs.includes(ogImg)) imgs.unshift(ogImg);
+    d.images_json = JSON.stringify([...new Set(imgs)]);
+    d.image_url   = imgs[0] || '';
+  }
+  else if (platform === 'meinestadt') {
+    // meinestadt exposes often have data in the page title: "3 Zimmer - 68 m² - 559 € Kaltmiete"
+    const pageTitle = $('title').text();
+    const titleMatch = pageTitle.match(/^(.+?)\s*\|\s*/);
+    d.title = $('h1').first().text().trim() ||
+              $('meta[property="og:title"]').attr('content') || pageTitle;
+
+    // Extract from title string: "3 Zimmer - 68 m² - 559 € Kaltmiete"
+    d.rooms      = extractRooms(pageTitle) || extractRooms($('meta[property="og:title"]').attr('content') || '');
+    d.size       = extractSize(pageTitle)  || extractSize($('meta[property="og:title"]').attr('content') || '');
+    d.price_cold = extractPrice(pageTitle) || extractPrice($('[class*="price"], [class*="kalt"]').text());
+    d.price      = d.price_cold || extractPrice($('[class*="price"]').first().text());
+
+    // Location from meta description or address fields
+    d.location   = $('[class*="address"], [class*="location"]').first().text().trim() ||
+                   ($('meta[name="description"]').attr('content') || '').split(' in ').pop()?.split('.')[0] || '';
+    // Description from meta
+    d.description = $('meta[name="description"]').attr('content')?.substring(0, 800) || '';
+
+    // Features from meta description (e.g. "Balkon / Terrasse, Keller, ...")
+    const metaDesc = $('meta[name="description"]').attr('content') || '';
+    const ausstMatch = metaDesc.match(/Ausstattung:\s*(.+?)(?:\.|$)/);
+    if (ausstMatch) {
+      ausstMatch[1].split(',').forEach(tag => {
+        const t = tag.trim();
+        if (t) d.description += (d.description ? '\n' : '') + t;
+      });
+    }
+
+    // Images
+    const ogImg = $('meta[property="og:image"]').attr('content') || '';
+    const imgs  = collectImages($, ['[class*="gallery"] img', '[class*="image"] img', 'img[src*="image-service"]']);
+    if (ogImg) imgs.unshift(ogImg);
+    d.images_json = JSON.stringify([...new Set(imgs)]);
+    d.image_url   = imgs[0] || ogImg;
+
+    // meinestadt shows "Immobilie nicht mehr verfügbar" for expired listings
+    const visibleBody = getVisibleText($, 'body');
+    if (visibleBody.includes('nicht mehr verfügbar') ||
+        visibleBody.includes('bereits vergeben')) {
+      d.status = 'offline';
+    }
   }
 
   // OpenGraph fallbacks
@@ -272,33 +740,64 @@ async function scrapeListing(url) {
   if (!d.image_url)   d.image_url   = $('meta[property="og:image"]').attr('content') || '';
   if (d.images_json === '[]' && d.image_url) d.images_json = JSON.stringify([d.image_url]);
 
+  // Real coordinates — Kleinanzeigen (and some other listing sites) embed
+  // exact latitude/longitude as standard Open Graph meta tags. When present,
+  // this lets the detail view show a genuine embedded map instead of only a
+  // "open in maps app" link built from a fuzzy address string.
+  const ogLat = parseFloat($('meta[property="og:latitude"]').attr('content'));
+  const ogLng = parseFloat($('meta[property="og:longitude"]').attr('content'));
+  if (Number.isFinite(ogLat) && Number.isFinite(ogLng)) {
+    d.latitude  = ogLat;
+    d.longitude = ogLng;
+  }
+
+  // Fallback: platforms without native coordinates (e.g. rentola) still
+  // usually give us a text address — geocode that via Nominatim so the
+  // map embed works there too, not just on Kleinanzeigen.
+  if (!Number.isFinite(d.latitude) && d.location?.trim()) {
+    const geo = await geocodeLocation(d.location);
+    if (geo) { d.latitude = geo.lat; d.longitude = geo.lon; }
+  }
+
   // Tags
-  d.tags_json = JSON.stringify(extractTags($, platform, d.description));
+  const baseTags = extractTags($, platform, d.description);
+  const allTags  = [...new Set([...(typeof extraFactTags !== 'undefined' ? extraFactTags : []), ...baseTags])];
+  d.tags_json = JSON.stringify(allTags.slice(0, 12));
 
   return d;
 }
 
-// ── Check existing listings for offline/reserved status ───
-async function checkExistingListings(listings, onUpdate) {
-  const results = { offline: 0, reserved: 0 };
+// ── Check existing listings for offline/reserved status AND changes ──
+// Beyond the offline/reserved status flip, this also re-scrapes each
+// listing fully so title/price/size/rooms changes get caught too (a
+// landlord editing the title, dropping the price, or a listing quietly
+// getting reserved without the page's status text saying so explicitly).
+async function checkExistingListings(listings, onStatusChange, onFieldChange) {
+  const results = { offline: 0, reserved: 0, changed: 0 };
+  const TRACKED_FIELDS = ['title', 'price', 'price_cold', 'size', 'rooms'];
+
   for (const listing of listings) {
     try {
-      let html;
-      try { html = await fetchPage(listing.url, 12000); }
-      catch (e) {
-        if (e.message.includes('404') || e.message.includes('410')) {
-          onUpdate(listing.id, 'offline');
-          results.offline++;
+      const fresh = await scrapeListing(listing.url);
+
+      if (fresh.status && fresh.status !== 'active') {
+        onStatusChange(listing.id, fresh.status);
+        results[fresh.status] = (results[fresh.status] || 0) + 1;
+      }
+
+      if (onFieldChange) {
+        const changes = [];
+        for (const field of TRACKED_FIELDS) {
+          const oldVal = (listing[field] || '').trim();
+          const newVal = (fresh[field]  || '').trim();
+          if (newVal && oldVal !== newVal) changes.push({ field, oldVal, newVal });
         }
-        await sleep(1000 + Math.random() * 1000);
-        continue;
+        if (changes.length) {
+          onFieldChange(listing.id, changes, fresh);
+          results.changed++;
+        }
       }
-      const $      = cheerio.load(html);
-      const status = checkListingStatus($, detectPlatform(listing.url));
-      if (status !== 'active') {
-        onUpdate(listing.id, status);
-        results[status] = (results[status] || 0) + 1;
-      }
+
       await sleep(1500 + Math.random() * 1500);
     } catch (e) {
       console.warn(`[Poller] Status-check Fehler für ${listing.url}: ${e.message}`);

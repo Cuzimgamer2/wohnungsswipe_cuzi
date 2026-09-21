@@ -85,6 +85,7 @@ function showView(name, isSubNav = false) {
   if (name === 'jobs')     loadJobs();
   if (name === 'settings') loadSettings();
   if (name === 'archive')  loadArchive();
+  if (name === 'add')      loadMyAddedListings();
 }
 
 document.querySelectorAll('.tab-nav').forEach(btn =>
@@ -154,6 +155,7 @@ function onLogin(data) {
   $id('nav-username').textContent = data.username;
   showScreen('app-screen');
   loadGroups().then(() => loadSwipeQueue());
+  openSharedListingFromUrl();
 }
 
 async function doLogout() {
@@ -212,6 +214,260 @@ $id('lb-next').onclick  = () => lb.go(1);
 $id('lightbox').addEventListener('click', e => { if (e.target === $id('lightbox')) lb.close(); });
 
 // ══════════════════════════════════════════════════════════
+//  DETAIL VIEW
+//  A full in-app view of a listing (all photos, full description,
+//  a map shortcut, and — only when opened from the Swipe page — the
+//  swipe actions themselves) so tapping through to the original
+//  listing becomes the exception rather than the default habit.
+// ══════════════════════════════════════════════════════════
+const detailView = {
+  listing:   null,
+  imgs:      [],
+  idx:       0,
+  fromSwipe: false,
+
+  open(listing, opts = {}) {
+    this.listing   = listing;
+    this.imgs      = parseImages(listing);
+    this.idx       = 0;
+    this.fromSwipe = !!opts.fromSwipe;
+
+    $id('detail-platform').textContent = listing.platform || 'Inserat';
+    $id('detail-title').textContent    = listing.title || 'Inserat';
+
+    const cold  = (listing.price_cold || '').trim();
+    const total = (listing.price      || '').trim();
+    $id('detail-price').innerHTML = cold
+      ? `${esc(cold)} <span class="detail-price-sub">kalt</span>${total && total !== cold ? ` &nbsp;·&nbsp; ${esc(total)} warm` : ''}`
+      : (total ? esc(total) : '<span class="detail-price-sub">Preis nicht angegeben</span>');
+
+    const metaParts = [];
+    if (listing.size)     metaParts.push(`📐 ${esc(listing.size)}`);
+    if (listing.rooms)    metaParts.push(`🚪 ${esc(listing.rooms)} Zimmer`);
+    if (listing.location) metaParts.push(`📍 ${esc(listing.location)}`);
+    $id('detail-meta').innerHTML = metaParts.map(m => `<span class="detail-meta-item">${m}</span>`).join('');
+
+    // Structured cost/meta breakdown (Nebenkosten, Heizkosten, Kaution,
+    // Wohnungstyp, Verfügbar ab) — only rendered when at least one field
+    // was actually scraped, so older listings without this data don't
+    // show an empty box.
+    const costRows = [
+      ['Nebenkosten',    listing.nebenkosten],
+      ['Heizkosten',     listing.heizkosten],
+      ['Kaution',        listing.kaution],
+      ['Wohnungstyp',    listing.property_type],
+      ['Verfügbar ab',   listing.available_from],
+    ].filter(([, v]) => v && v.trim());
+    const costsEl = $id('detail-costs');
+    if (costRows.length) {
+      costsEl.style.display = '';
+      costsEl.innerHTML = costRows.map(([label, val]) =>
+        `<div class="detail-cost-row"><span class="detail-cost-label">${esc(label)}</span><span class="detail-cost-value">${esc(val)}</span></div>`
+      ).join('');
+    } else {
+      costsEl.style.display = 'none';
+      costsEl.innerHTML = '';
+    }
+
+    this._loadChanges(listing.id);
+
+    const tags = parseTags(listing.tags_json);
+    $id('detail-tags').innerHTML = tags.map(t => `<span class="detail-tag">${esc(t)}</span>`).join('');
+
+    $id('detail-description').textContent = listing.description?.trim() || 'Keine Beschreibung verfügbar.';
+
+    // Status badge (reserved/offline) — mirrors the small badges shown on cards
+    const statusBadge = $id('detail-status-badge');
+    if (listing.status === 'reserved') {
+      statusBadge.textContent = 'Reserviert'; statusBadge.className = 'detail-status-badge status-reserved'; statusBadge.style.display = '';
+    } else if (listing.status === 'offline') {
+      statusBadge.textContent = 'Offline'; statusBadge.className = 'detail-status-badge status-offline'; statusBadge.style.display = '';
+    } else {
+      statusBadge.style.display = 'none';
+    }
+
+    // Embedded map — when Kleinanzeigen (or another platform) exposes real
+    // coordinates via og:latitude/og:longitude, show an actual OpenStreetMap
+    // preview right in the detail view instead of only a text-based link.
+    // OSM's embed endpoint needs no API key and works for any public location.
+    const mapEmbed = $id('detail-map-embed');
+    const mapLabel = $id('detail-map-label');
+    const hasCoords = Number.isFinite(listing.latitude) && Number.isFinite(listing.longitude);
+    if (hasCoords) {
+      const lat = listing.latitude, lon = listing.longitude;
+      const d = 0.006; // small bounding box around the point, roughly a few hundred metres
+      const bbox = `${lon - d}%2C${lat - d}%2C${lon + d}%2C${lat + d}`;
+      mapEmbed.innerHTML = `<iframe
+        src="https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat}%2C${lon}"
+        loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>`;
+      mapEmbed.style.display = ''; mapLabel.style.display = '';
+    } else {
+      mapEmbed.style.display = 'none'; mapLabel.style.display = 'none';
+      mapEmbed.innerHTML = '';
+    }
+
+    // "Open in maps app" — precise coordinates when we have them, otherwise
+    // fall back to a text search built from the scraped address.
+    const mapBtn = $id('detail-map-btn');
+    if (hasCoords) {
+      mapBtn.style.display = '';
+      mapBtn.onclick = () => {
+        window.open(`https://www.google.com/maps/search/?api=1&query=${listing.latitude}%2C${listing.longitude}`, '_blank', 'noopener');
+      };
+    } else if (listing.location?.trim()) {
+      mapBtn.style.display = '';
+      mapBtn.onclick = () => {
+        const q = encodeURIComponent(listing.location.trim());
+        window.open(`https://www.google.com/maps/search/?api=1&query=${q}`, '_blank', 'noopener');
+      };
+    } else {
+      mapBtn.style.display = 'none';
+    }
+
+    $id('detail-original-link').href = listing.url || '#';
+    $id('detail-quick-original').href = listing.url || '#';
+
+    // Swipe actions only make sense (and only stay in sync with the queue)
+    // when opened from the swipe page itself.
+    $id('detail-swipe-actions').style.display = this.fromSwipe ? 'flex' : 'none';
+
+    this._renderGallery();
+    $id('detail-view').style.display = 'flex';
+    document.addEventListener('keydown', detailView._key);
+  },
+
+  close() {
+    $id('detail-view').style.display = 'none';
+    document.removeEventListener('keydown', detailView._key);
+    this.listing = null;
+  },
+
+  _renderGallery() {
+    const img   = $id('detail-gallery-img');
+    const ph    = $id('detail-gallery-placeholder');
+    const thumbs = $id('detail-gallery-thumbs');
+
+    if (this.imgs.length) {
+      img.style.display = ''; ph.style.display = 'none';
+      img.src = this.imgs[this.idx];
+    } else {
+      img.style.display = 'none'; ph.style.display = 'flex';
+    }
+
+    $id('detail-gallery-counter').textContent = this.imgs.length ? `${this.idx + 1} / ${this.imgs.length}` : '';
+    $id('detail-gallery-prev').style.display  = this.imgs.length > 1 ? '' : 'none';
+    $id('detail-gallery-next').style.display  = this.imgs.length > 1 ? '' : 'none';
+
+    thumbs.innerHTML = '';
+    if (this.imgs.length > 1) {
+      this.imgs.forEach((src, i) => {
+        const t = document.createElement('img');
+        t.src = src; t.className = 'detail-gallery-thumb' + (i === this.idx ? ' active' : '');
+        t.onclick = () => { this.idx = i; this._renderGallery(); };
+        thumbs.appendChild(t);
+      });
+      thumbs.querySelector('.detail-gallery-thumb.active')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+    }
+  },
+
+  galleryGo(d) {
+    if (!this.imgs.length) return;
+    this.idx = (this.idx + d + this.imgs.length) % this.imgs.length;
+    this._renderGallery();
+  },
+
+  async _loadChanges(listingId) {
+    const el = $id('detail-changes');
+    el.style.display = 'none'; el.innerHTML = '';
+    const fieldLabels = { title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer' };
+    try {
+      const { changes = [] } = await api(`/api/listings/${listingId}/changes`);
+      if (!changes.length) return;
+      // Only render if this is still the listing being viewed (guards
+      // against a slow request resolving after the user already switched).
+      if (!this.listing || this.listing.id !== listingId) return;
+      el.style.display = '';
+      el.innerHTML = `
+        <div class="detail-section-label">Änderungsverlauf</div>
+        ${changes.slice(0, 8).map(c => {
+          const label = fieldLabels[c.field] || c.field;
+          const date  = new Date(c.changed_at + 'Z').toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
+          return `<div class="detail-change-row">
+            <span class="detail-change-date">${date}</span>
+            <span class="detail-change-desc"><strong>${esc(label)}</strong> geändert: ${esc(c.old_value || '—')} → ${esc(c.new_value || '—')}</span>
+          </div>`;
+        }).join('')}
+      `;
+    } catch (e) { /* silently skip — history is a nice-to-have, not critical */ }
+  },
+
+  _key(e) {
+    if (e.key === 'Escape') { detailView.close(); return; }
+
+    if (detailView.fromSwipe) {
+      // Opened from the Swipe page: arrow keys drive the same swipe
+      // actions as the main page, so users never lose keyboard flow just
+      // because they tapped into the detail view. Gallery photos are still
+      // browsable via the on-screen ‹ › buttons.
+      if (e.key === 'Backspace' || (e.key.toLowerCase() === 'z' && !e.ctrlKey && !e.metaKey)) {
+        if (state.lastSwipe) { e.preventDefault(); undoLastSwipe(); detailView.close(); }
+        return;
+      }
+      if (!detailView.listing) return;
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); doSwipe(detailView.listing, 'dislike');   detailView.close(); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); doSwipe(detailView.listing, 'like');      detailView.close(); }
+      if (e.key === 'ArrowUp')    { e.preventDefault(); doSwipe(detailView.listing, 'superlike'); detailView.close(); }
+      if (e.key === 'ArrowDown')  { e.preventDefault(); doSwipe(detailView.listing, 'skip');      detailView.close(); }
+    } else {
+      // Opened from Bewertet/Archiv/Gruppen/etc. — no swipe actions apply
+      // here, so arrow keys are free for browsing the photo gallery.
+      if (e.key === 'ArrowLeft')  detailView.galleryGo(-1);
+      if (e.key === 'ArrowRight') detailView.galleryGo(1);
+    }
+  },
+};
+
+$id('detail-close').onclick        = () => detailView.close();
+$id('detail-gallery-prev').onclick = () => detailView.galleryGo(-1);
+$id('detail-gallery-next').onclick = () => detailView.galleryGo(1);
+$id('detail-view').addEventListener('click', e => { if (e.target.id === 'detail-view') detailView.close(); });
+
+$id('detail-quick-share').onclick = async () => {
+  if (!detailView.listing) return;
+  const shareUrl   = `${location.origin}${location.pathname}?listing=${detailView.listing.id}`;
+  const shareTitle = detailView.listing.title || 'Inserat';
+  const priceStr   = detailView.listing.price_cold || detailView.listing.price || '';
+  const shareText  = priceStr ? `${shareTitle} – ${priceStr}` : shareTitle;
+
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: shareTitle, text: shareText, url: shareUrl });
+    } catch (e) { /* user cancelled the native share sheet — nothing to do */ }
+  } else {
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      toast('🔗 Link kopiert!');
+    } catch (e) {
+      toast('❌ Konnte Link nicht kopieren');
+    }
+  }
+};
+
+$id('detail-btn-like').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'like'); detailView.close(); }
+};
+$id('detail-btn-dislike').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'dislike'); detailView.close(); }
+};
+$id('detail-btn-superlike').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'superlike'); detailView.close(); }
+};
+$id('detail-btn-skip').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'skip'); detailView.close(); }
+};
+$id('detail-btn-undo').onclick = () => { undoLastSwipe(); detailView.close(); };
+
+// ══════════════════════════════════════════════════════════
 //  CARD BUILDERS
 // ══════════════════════════════════════════════════════════
 function buildSwipeCard(listing) {
@@ -248,11 +504,14 @@ function buildSwipeCard(listing) {
       </div>
       ${tags.length ? `<div class="card-tags">${tags.map(t=>`<span class="card-tag">${esc(t)}</span>`).join('')}</div>` : ''}
       ${listing.description ? `<div class="card-desc">${esc(listing.description)}</div>` : ''}
-      <a class="card-link" href="${esc(listing.url)}" target="_blank" rel="noopener">Inserat öffnen →</a>
+      <button class="card-link" data-open-detail type="button">Details ansehen →</button>
     </div>`;
 
   card.querySelector('[data-gallery]')?.addEventListener('click', e => {
     e.stopPropagation(); lb.open(images, 0);
+  });
+  card.querySelector('[data-open-detail]')?.addEventListener('click', e => {
+    e.stopPropagation(); detailView.open(listing, { fromSwipe: true });
   });
   return card;
 }
@@ -267,6 +526,11 @@ function buildListCard(listing, opts = {}) {
   const swipeLabelMap = { like:'♥ Like', superlike:'⭐ Super-Like', dislike:'✕ Nein' };
   const cardUid = `lc_${listing.id}_${Math.random().toString(36).slice(2,7)}`;
 
+  // Only the person who manually added a listing (no search-agent source) can
+  // change its visibility from the card menu.
+  const canChangeVisibility = !listing.source_job_id && listing.added_by === state.user?.userId;
+  const visLabel = { global:'🌐 Alle', private:'🔒 Nur ich', group:'👥 Gruppe' }[listing.visibility || 'global'];
+
   const div = document.createElement('div');
   div.className = 'list-card';
 
@@ -278,12 +542,26 @@ function buildListCard(listing, opts = {}) {
       ${images.length > 1 ? `<span class="list-card-photo-badge">📷 ${images.length}</span>` : ''}
       ${listing.status === 'offline'   ? `<span class="list-card-offline-badge">Offline</span>` : ''}
       ${listing.status === 'reserved'  ? `<span class="list-card-offline-badge" style="background:rgba(240,200,60,.8)">Reserviert</span>` : ''}
-      <button class="card-menu-btn" data-menu-toggle title="Optionen">⋮</button>
-      <div class="card-menu" data-menu style="display:none">
-        ${!opts.isArchive ? `<button data-menu-action="unswipe">↩ Bewertung zurückziehen</button>` : ''}
-        <button data-menu-action="contact-toggle">${listing.contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}</button>
-      </div>
     </div>
+    <button class="card-menu-btn" data-menu-toggle title="Optionen">⋮</button>
+    <div class="card-menu" data-menu style="display:none">
+      ${!opts.isArchive ? `<button data-menu-action="unswipe">↩ Bewertung zurückziehen</button>` : ''}
+      <button data-menu-action="contact-toggle">${listing.contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}</button>
+      ${canChangeVisibility ? `
+      <div class="card-menu-divider"></div>
+      <div class="card-menu-section-label">Sichtbarkeit (${esc(visLabel)})</div>
+      <button data-vis-action="global">🌐 Alle Nutzer</button>
+      <button data-vis-action="private">🔒 Nur ich</button>
+      <button data-vis-action="group">👥 Gruppe wählen…</button>
+      ` : ''}
+    </div>
+    ${canChangeVisibility ? `
+    <div class="vis-group-picker" data-vis-group-picker style="display:none">
+      <select data-vis-group-select>
+        <option value="">Gruppe wählen…</option>
+      </select>
+      <button data-vis-group-confirm>OK</button>
+    </div>` : ''}
     <div class="list-card-body">
       <div class="list-card-title">${esc(listing.title || 'Inserat')}</div>
       ${cold  ? `<div class="list-card-price">${esc(cold)} <span style="font-size:.7rem;font-weight:400;color:var(--text2)">kalt</span></div>` : ''}
@@ -297,7 +575,7 @@ function buildListCard(listing, opts = {}) {
       ${opts.matchInfo ? `<div class="match-count" style="font-size:.76rem;color:var(--like);margin-bottom:5px">${esc(opts.matchInfo)}</div>` : ''}
       ${swipe ? `<div class="swipe-badge ${swipe}">${swipeLabelMap[swipe]||swipe}</div>` : ''}
       ${listing.contacted ? `<div class="contacted-badge">📬 Angeschrieben${listing.contact_note ? ' · ' + esc(listing.contact_note.substring(0,40)) : ''}</div>` : ''}
-      <a class="list-card-link" href="${esc(listing.url)}" target="_blank" rel="noopener">Inserat öffnen →</a>
+      <button class="list-card-link" data-open-detail type="button">Details ansehen →</button>
       <div class="contact-note-wrap" data-note-wrap>
         <textarea class="contact-note" placeholder="Notiz (optional): Wann kontaktiert, Antwort, etc." data-note-text>${esc(listing.contact_note || '')}</textarea>
         <div class="contact-note-actions">
@@ -312,6 +590,10 @@ function buildListCard(listing, opts = {}) {
     lb.open(images);
   });
 
+  div.querySelector('[data-open-detail]')?.addEventListener('click', e => {
+    e.stopPropagation(); detailView.open(listing);
+  });
+
   // ── Three-dot menu wiring ──
   const menuBtn  = div.querySelector('[data-menu-toggle]');
   const menu     = div.querySelector('[data-menu]');
@@ -321,13 +603,17 @@ function buildListCard(listing, opts = {}) {
   menuBtn.addEventListener('click', e => {
     e.stopPropagation();
     closeAllCardMenus(menu);
-    menu.style.display = menu.style.display === 'none' ? '' : 'none';
+    const willOpen = menu.style.display === 'none';
+    menu.style.display = willOpen ? 'flex' : 'none';
+    div.classList.toggle('menu-open', willOpen);
+    if (willOpen) positionMenuNearButton(menu, menuBtn);
   });
 
   menu.querySelectorAll('[data-menu-action]').forEach(btn => {
     btn.addEventListener('click', async e => {
       e.stopPropagation();
       menu.style.display = 'none';
+      div.classList.remove('menu-open');
       const action = btn.dataset.menuAction;
 
       if (action === 'unswipe') {
@@ -364,6 +650,70 @@ function buildListCard(listing, opts = {}) {
     });
   });
 
+  // ── Visibility change wiring (only present for own manually-added listings) ──
+  if (canChangeVisibility) {
+    const groupPicker = div.querySelector('[data-vis-group-picker]');
+    const groupSelect  = div.querySelector('[data-vis-group-select]');
+
+    div.querySelectorAll('[data-vis-action]').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        const choice = btn.dataset.visAction;
+        if (choice === 'group') {
+          // Populate group options then show the inline picker instead of saving immediately
+          menu.style.display = 'none';
+          div.classList.remove('menu-open');
+          while (groupSelect.options.length > 1) groupSelect.remove(1);
+          state.groups.forEach(g => {
+            const o = document.createElement('option');
+            o.value = g.id; o.textContent = g.name;
+            if (listing.visibility_id == g.id) o.selected = true;
+            groupSelect.appendChild(o);
+          });
+          groupPicker.style.display = 'flex';
+          positionMenuNearButton(groupPicker, menuBtn);
+          return;
+        }
+        // global / private → save immediately
+        menu.style.display = 'none';
+        div.classList.remove('menu-open');
+        const r = await api(`/api/listings/${listing.id}/visibility`, {
+          method: 'PATCH', body: { visibility: choice, visibility_id: null },
+        });
+        if (r.success) {
+          listing.visibility = r.visibility;
+          listing.visibility_id = r.visibility_id;
+          const label = { global:'🌐 Alle Nutzer', private:'🔒 Nur ich' }[choice];
+          toast(`✓ Sichtbarkeit: ${label}`);
+          const secLabel = div.querySelector('.card-menu-section-label');
+          if (secLabel) secLabel.textContent = `Sichtbarkeit (${label})`;
+        } else {
+          toast('❌ ' + (r.error || 'Fehler'));
+        }
+      });
+    });
+
+    div.querySelector('[data-vis-group-confirm]')?.addEventListener('click', async e => {
+      e.stopPropagation();
+      const gid = groupSelect.value;
+      if (!gid) { toast('⚠️ Bitte eine Gruppe wählen'); return; }
+      const r = await api(`/api/listings/${listing.id}/visibility`, {
+        method: 'PATCH', body: { visibility: 'group', visibility_id: gid },
+      });
+      groupPicker.style.display = 'none';
+      if (r.success) {
+        listing.visibility = 'group';
+        listing.visibility_id = gid;
+        const groupName = state.groups.find(g => g.id == gid)?.name || 'Gruppe';
+        toast(`✓ Sichtbarkeit: 👥 ${groupName}`);
+        const secLabel = div.querySelector('.card-menu-section-label');
+        if (secLabel) secLabel.textContent = `Sichtbarkeit (👥 ${groupName})`;
+      } else {
+        toast('❌ ' + (r.error || 'Fehler'));
+      }
+    });
+  }
+
   div.querySelector('[data-note-save]')?.addEventListener('click', async () => {
     await api(`/api/contacts/${listing.id}`, { method: 'PATCH', body: {
       note: noteText?.value || '', groupId: opts.groupId || null,
@@ -388,13 +738,52 @@ function buildListCard(listing, opts = {}) {
 }
 
 // Close all open card menus except the one passed in (or all if omitted)
+// Position a dropdown menu so it always stays fully within the viewport,
+// instead of relying on fixed CSS offsets (right:8px etc.) that only work
+// when there happens to be enough room. Anchors the menu just below the
+// trigger button, clamped so it never runs off the left/right/bottom edge —
+// this matters most on narrow mobile grid cards where a right-anchored menu
+// can easily overflow past the left edge of the screen.
+function positionMenuNearButton(menu, btn) {
+  const margin = 8;
+  const btnRect = btn.getBoundingClientRect();
+
+  // Make sure the menu is measurable (must be visible/display!=none already)
+  const menuRect = menu.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  // Default: align menu's right edge with the button's right edge, just below it
+  let left = btnRect.right - menuRect.width;
+  let top  = btnRect.bottom + 6;
+
+  // Clamp horizontally so it never runs off either edge of the screen
+  if (left < margin) left = margin;
+  if (left + menuRect.width > vw - margin) left = Math.max(margin, vw - menuRect.width - margin);
+
+  // If there isn't room below, flip above the button instead
+  if (top + menuRect.height > vh - margin) {
+    const above = btnRect.top - menuRect.height - 6;
+    top = above > margin ? above : margin;
+  }
+
+  menu.style.position = 'fixed';
+  menu.style.left     = `${left}px`;
+  menu.style.top      = `${top}px`;
+  menu.style.right    = 'auto';
+}
+
 function closeAllCardMenus(except = null) {
   document.querySelectorAll('.card-menu').forEach(m => {
-    if (m !== except) m.style.display = 'none';
+    if (m !== except) {
+      m.style.display = 'none';
+      m.closest('.list-card')?.classList.remove('menu-open');
+    }
   });
+  document.querySelectorAll('.vis-group-picker').forEach(p => p.style.display = 'none');
 }
 document.addEventListener('click', e => {
-  if (!e.target.closest('[data-menu-toggle]') && !e.target.closest('[data-menu]')) {
+  if (!e.target.closest('[data-menu-toggle]') && !e.target.closest('[data-menu]') && !e.target.closest('.vis-group-picker')) {
     closeAllCardMenus();
   }
 });
@@ -553,6 +942,7 @@ function attachDrag(card, listing) {
     dragging = false;
     bl.style.opacity = bd.style.opacity = bs.style.opacity = 0;
     const dx = cx - sx, dy = cy - sy;
+    const dist = Math.max(Math.abs(dx), Math.abs(dy));
     if      (dy < -100 && Math.abs(dx) < 100) doSwipe(listing, 'superlike');
     else if (dx >  100)                        doSwipe(listing, 'like');
     else if (dx < -100)                        doSwipe(listing, 'dislike');
@@ -560,16 +950,21 @@ function attachDrag(card, listing) {
       card.style.transition = 'transform 0.35s cubic-bezier(.16,1,.3,1)';
       card.style.transform  = '';
       card.style.zIndex     = '';
+      // A clean tap (negligible movement, not an aborted swipe attempt)
+      // opens the full detail view instead of just snapping back.
+      if (dist < 8) detailView.open(listing, { fromSwipe: true });
     }
   }
 
   const onMove = e => move(e.clientX, e.clientY);
   const onUp   = end;
 
-  card.addEventListener('mousedown',  e => { if (e.button === 0) start(e.clientX, e.clientY); });
+  const isInteractive = e => !!e.target.closest('[data-gallery], [data-open-detail], a, button');
+
+  card.addEventListener('mousedown',  e => { if (e.button === 0 && !isInteractive(e)) start(e.clientX, e.clientY); });
   document.addEventListener('mousemove', onMove);
   document.addEventListener('mouseup',   onUp);
-  card.addEventListener('touchstart', e => { const t = e.touches[0]; start(t.clientX, t.clientY); }, { passive: true });
+  card.addEventListener('touchstart', e => { if (isInteractive(e)) return; const t = e.touches[0]; start(t.clientX, t.clientY); }, { passive: true });
   card.addEventListener('touchmove',  e => { const t = e.touches[0]; move(t.clientX, t.clientY); e.preventDefault(); }, { passive: false });
   card.addEventListener('touchend',   end);
 
@@ -582,7 +977,27 @@ function attachDrag(card, listing) {
 
 async function doSwipe(listing, action) {
   const card = $id('card-stack').querySelector(`.swipe-card[data-id="${listing.id}"]`);
-  if (!card || card.classList.contains('fly-left') || card.classList.contains('fly-right') || card.classList.contains('fly-up') || card.classList.contains('fly-down')) return;
+  const isFlying = card && (card.classList.contains('fly-left') || card.classList.contains('fly-right') || card.classList.contains('fly-up') || card.classList.contains('fly-down'));
+  if (isFlying) return;
+
+  const toastMsg = {
+    like:      '💚 Gefällt dir!',
+    dislike:   '✕ Abgelehnt',
+    superlike: '⭐ Super-Like!',
+    skip:      '⏭ Übersprungen – kommt später wieder',
+  }[action];
+
+  // Fire API in background
+  api('/api/listings/swipe', { method: 'POST', body: { listingId: listing.id, action } });
+
+  // Track for the undo button (always remembers the most recent swipe in this session)
+  state.lastSwipe = { listing, action };
+  updateUndoButton();
+
+  // No matching card in the stack — this listing was never part of the
+  // active swipe queue (e.g. opened directly via a shared link). Just
+  // record the swipe and confirm with a toast; there's no card to animate.
+  if (!card) { toast(toastMsg); return; }
 
   // Detach drag immediately
   if (_dragCleanup) { _dragCleanup(); _dragCleanup = null; }
@@ -596,21 +1011,7 @@ async function doSwipe(listing, action) {
 
   const flyClass = { like: 'fly-right', dislike: 'fly-left', superlike: 'fly-up', skip: 'fly-down' }[action];
   card.classList.add(flyClass);
-
-  const toastMsg = {
-    like:      '💚 Gefällt dir!',
-    dislike:   '✕ Abgelehnt',
-    superlike: '⭐ Super-Like!',
-    skip:      '⏭ Übersprungen – kommt später wieder',
-  }[action];
   toast(toastMsg);
-
-  // Fire API in background
-  api('/api/listings/swipe', { method: 'POST', body: { listingId: listing.id, action } });
-
-  // Track for the undo button (always remembers the most recent swipe in this session)
-  state.lastSwipe = { listing, action };
-  updateUndoButton();
 
   // Remove from queue immediately so renderStack knows what's next.
   // Skipped listings get pushed to the back of the queue instead of removed entirely,
@@ -630,8 +1031,9 @@ async function doSwipe(listing, action) {
 
 function updateUndoButton() {
   const btn = $id('btn-undo');
-  if (!btn) return;
-  btn.disabled = !state.lastSwipe;
+  if (btn) btn.disabled = !state.lastSwipe;
+  const detailBtn = $id('detail-btn-undo');
+  if (detailBtn) detailBtn.disabled = !state.lastSwipe;
 }
 
 async function undoLastSwipe() {
@@ -669,6 +1071,7 @@ $id('btn-undo').onclick      = () => undoLastSwipe();
 document.addEventListener('keydown', e => {
   if (!state.user) return;
   if ($id('lightbox').style.display !== 'none') return;
+  if ($id('detail-view').style.display !== 'none') return;
   if (document.querySelector('.modal[style*="flex"]')) return;
   if (!$id('view-swipe').classList.contains('active')) return;
 
@@ -689,12 +1092,17 @@ document.addEventListener('keydown', e => {
 //  ADD LISTING
 // ══════════════════════════════════════════════════════════
 $id('add-listing-btn').addEventListener('click', async () => {
-  const url = $id('listing-url').value.trim();
+  const url        = $id('listing-url').value.trim();
+  const visibility  = $id('add-visibility').value;
+  const visGrp      = $id('add-visibility-group').value;
   clr('add-error');
   if (!url.startsWith('http')) return setErr('add-error', 'Bitte eine gültige URL eingeben');
+  if (visibility === 'group' && !visGrp) return setErr('add-error', 'Bitte eine Gruppe wählen');
   const btnText = $id('add-btn-text'), spinner = $id('add-btn-spinner'), btn = $id('add-listing-btn');
   btnText.style.display = 'none'; spinner.style.display = 'inline'; btn.disabled = true;
-  const d = await api('/api/listings/add', { method:'POST', body:{ url } });
+  const d = await api('/api/listings/add', { method:'POST', body:{
+    url, visibility, visibility_id: visibility === 'group' ? visGrp : null,
+  }});
   btnText.style.display = 'inline'; spinner.style.display = 'none'; btn.disabled = false;
   if (d.error) return setErr('add-error', d.error);
   $id('listing-url').value = '';
@@ -703,7 +1111,39 @@ $id('add-listing-btn').addEventListener('click', async () => {
   $id('add-preview').style.display = '';
   toast('✅ Inserat hinzugefügt!');
   state.swipeQueue = [];
+  loadMyAddedListings();
 });
+
+// Show/hide group selector based on visibility choice (manual add page)
+$id('add-visibility').addEventListener('change', () => {
+  const isGroup = $id('add-visibility').value === 'group';
+  $id('add-visibility-group-row').style.display = isGroup ? '' : 'none';
+});
+
+function populateAddGroupSelect() {
+  const sel = $id('add-visibility-group');
+  if (!sel) return;
+  while (sel.options.length > 1) sel.remove(1);
+  state.groups.forEach(g => {
+    const o = document.createElement('option');
+    o.value = g.id; o.textContent = g.name;
+    sel.appendChild(o);
+  });
+}
+
+// History of listings the current user has manually added
+async function loadMyAddedListings() {
+  populateAddGroupSelect();
+  const d = await api('/api/listings/mine');
+  const list  = $id('my-added-list');
+  const empty = $id('my-added-empty');
+  if (!list) return;
+  list.innerHTML = '';
+  const listings = d.listings || [];
+  if (!listings.length) { empty.style.display = ''; return; }
+  empty.style.display = 'none';
+  listings.forEach(l => list.appendChild(buildListCard(l)));
+}
 
 // ══════════════════════════════════════════════════════════
 //  RATED
@@ -774,14 +1214,36 @@ async function openGroupDetail(group) {
   $id('groups-main').style.display   = 'none';
   $id('group-detail').style.display  = '';
 
-  const [{ members = [] }, { results = [], memberCount = 0 }] = await Promise.all([
+  // Load swipe status in parallel
+  const [{ members = [] }, { results = [], memberCount = 0 }, { status: swipeStatus = [] }] = await Promise.all([
     api(`/api/groups/${group.id}/members`),
     api(`/api/groups/${group.id}/results`),
+    api(`/api/groups/${group.id}/swipe-status`),
   ]);
+  const resultsById = Object.fromEntries(results.map(r => [r.id, r]));
 
-  const membersHtml = members.map(m =>
-    `<span class="member-chip">${esc(m.username)}${m.id===state.user?.userId?' <span class="you-badge">(du)</span>':''}</span>`
-  ).join('');
+  // Build members section with nudge buttons
+  const myId = state.user?.userId;
+  const membersHtml = members.map(m => {
+    const sw = swipeStatus.find(s => s.id === m.id);
+    const isMe = m.id === myId;
+    const pendingCount = sw?.pending ?? '?';
+    const doneCount    = sw?.swiped  ?? 0;
+    const allDone      = sw && sw.pending === 0;
+    const statusColor  = allDone ? 'var(--like)' : pendingCount > 10 ? 'var(--dislike)' : 'var(--accent)';
+
+    return `
+      <div class="member-card">
+        <div class="member-card-avatar">${esc(m.username.charAt(0).toUpperCase())}</div>
+        <div class="member-card-info">
+          <span class="member-card-name">${esc(m.username)}${isMe ? ' <span class="you-badge">(du)</span>' : ''}</span>
+          <span class="member-card-status" style="color:${statusColor}">
+            ${allDone ? '✓ Alle geswiped' : `${pendingCount} noch offen`}
+          </span>
+        </div>
+        ${!isMe ? `<button class="nudge-btn" data-nudge="${m.id}" data-name="${esc(m.username)}" title="${esc(m.username)} erinnern zu swipen">👋</button>` : ''}
+      </div>`;
+  }).join('');
 
   const tiers = ['einstimmig','mehrheitlich','gespalten','abgelehnt'];
   const tierLabels = {
@@ -844,7 +1306,7 @@ async function openGroupDetail(group) {
                 <button data-note-cancel>Abbrechen</button>
               </div>
             </div>
-            <a href="${esc(r.url)}" target="_blank" rel="noopener" style="font-size:.73rem;color:var(--accent);display:block;margin-top:5px">Inserat öffnen →</a>
+            <button data-open-detail data-listing="${r.id}" type="button" style="font-size:.73rem;color:var(--accent);display:block;margin-top:5px;background:none;border:none;padding:0;cursor:pointer;text-align:left;font-family:inherit">Details ansehen →</button>
           </div>
         </div>`;
     }).join('');
@@ -864,7 +1326,7 @@ async function openGroupDetail(group) {
       </div>
     </div>
     <p class="section-label">Mitglieder</p>
-    <div class="members-list" style="margin-bottom:18px">${membersHtml}</div>
+    <div class="members-nudge-list" style="margin-bottom:18px">${membersHtml}</div>
     ${results.length
       ? `<p class="section-label">${memberCount} Mitglieder · ${results.length} gemeinsam bewertet</p>${tierSections}`
       : '<p style="color:var(--text2);font-size:.85rem">Noch keine Bewertungen in dieser Gruppe.</p>'}
@@ -872,7 +1334,26 @@ async function openGroupDetail(group) {
   window.__toast = toast;
   window.__lb    = lb;
 
-  // ── Event delegation for the three-dot menu ──────────────────────────────
+  // Wire nudge buttons
+  $id('group-detail-content').querySelectorAll('[data-nudge]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const uid  = parseInt(btn.dataset.nudge);
+      const name = btn.dataset.name;
+      btn.disabled = true;
+      btn.textContent = '⏳';
+      const r = await api(`/api/groups/${group.id}/nudge/${uid}`, { method: 'POST' });
+      if (r.success) {
+        toast(`👋 ${name} erinnert!`);
+        btn.textContent = '✓';
+        setTimeout(() => { btn.disabled = false; btn.textContent = '👋'; }, 30000);
+      } else {
+        toast('❌ ' + (r.error || 'Fehler'));
+        btn.disabled = false; btn.textContent = '👋';
+      }
+    });
+  });
+
+
   // IMPORTANT: openGroupDetail() can be called multiple times (after re-rate,
   // contact-mark etc.). We must remove the previous click listeners before
   // adding new ones, otherwise they accumulate and fight each other
@@ -891,13 +1372,25 @@ async function openGroupDetail(group) {
   const detailEl = $id('group-detail-content');
 
   detailEl.addEventListener('click', async e => {
+    // Open the in-app detail view
+    const detailBtn = e.target.closest('[data-open-detail]');
+    if (detailBtn) {
+      e.stopPropagation();
+      const lid = parseInt(detailBtn.dataset.listing);
+      const r   = resultsById[lid];
+      if (r) detailView.open(r);
+      return;
+    }
+
     // Open/close the menu
     const menuToggle = e.target.closest('[data-menu-toggle]');
     if (menuToggle) {
       e.stopPropagation();
       const menu = menuToggle.nextElementSibling;
       closeAllCardMenus(menu);
-      menu.style.display = menu.style.display === 'none' ? '' : 'none';
+      const willOpen = menu.style.display === 'none';
+      menu.style.display = willOpen ? 'flex' : 'none';
+      if (willOpen) positionMenuNearButton(menu, menuToggle);
       return;
     }
 
@@ -1040,13 +1533,32 @@ async function loadJobs() {
 }
 
 function renderJobs(jobs) {
-  const list  = $id('jobs-list');
-  const empty = $id('jobs-empty');
+  const list   = $id('jobs-list');
+  const empty  = $id('jobs-empty');
+  const header = $id('jobs-list-header');
   list.innerHTML = '';
-  if (!jobs.length) { empty.style.display=''; return; }
+  if (!jobs.length) { empty.style.display=''; header.style.display='none'; return; }
   empty.style.display = 'none';
+  header.style.display = 'flex';
   jobs.forEach(job => list.appendChild(buildJobCard(job)));
 }
+
+$id('reset-all-jobs-btn').addEventListener('click', async () => {
+  const confirmed = confirm(
+    'Alle Suchagenten zurücksetzen?\n\nAlle bisher gefundenen Inserate (inkl. Bewertungen/Notizen dazu) werden gelöscht, danach werden alle Suchagenten neu gescannt. Sinnvoll nach einem Fix am Scraper.'
+  );
+  if (!confirmed) return;
+  const btn = $id('reset-all-jobs-btn');
+  btn.disabled = true; btn.textContent = '🔄 Setze zurück…';
+  const r = await api('/api/jobs/reset-all', { method: 'POST' });
+  btn.disabled = false; btn.textContent = '🔄 Alle zurücksetzen';
+  if (r.success) {
+    toast(r.message || `✓ ${r.jobCount} Suchagenten zurückgesetzt`);
+    setTimeout(() => loadJobs(), 3000);
+  } else {
+    toast('❌ ' + (r.error || 'Fehler'));
+  }
+});
 
 function buildJobCard(job) {
   const div = document.createElement('div');
@@ -1091,7 +1603,12 @@ function buildJobCard(job) {
       <button class="btn-run"           data-run>⟳ Jetzt abrufen</button>
       <button class="btn-toggle ${job.active?'on':''}" data-toggle>${job.active?'⏸ Pausieren':'▶ Aktivieren'}</button>
       <button class="btn-vis"           data-vis>🔒 Sichtbarkeit</button>
+      <button class="btn-listings"      data-listings-toggle>📋 Inserate anzeigen</button>
+      <button class="btn-reset"         data-reset>🔄 Zurücksetzen</button>
       <button class="btn-del"           data-del>🗑 Löschen</button>
+    </div>
+    <div class="job-listings-panel" style="display:none" data-listings-panel>
+      <div class="job-listings-grid listings-grid" data-listings-grid></div>
     </div>
     <div class="vis-panel" style="display:none" data-vis-panel>
       <div class="vis-panel-inner">
@@ -1115,6 +1632,26 @@ function buildJobCard(job) {
       </div>
     </div>`;
 
+  div.querySelector('[data-listings-toggle]').addEventListener('click', async () => {
+    const panel = div.querySelector('[data-listings-panel]');
+    const grid  = div.querySelector('[data-listings-grid]');
+    const btn   = div.querySelector('[data-listings-toggle]');
+    const isOpen = panel.style.display !== 'none';
+    if (isOpen) { panel.style.display = 'none'; return; }
+
+    panel.style.display = '';
+    btn.textContent = '⏳ Lädt…';
+    const d = await api(`/api/jobs/${job.id}/listings`);
+    btn.textContent = '📋 Inserate anzeigen';
+    grid.innerHTML = '';
+    const listings = d.listings || [];
+    if (!listings.length) {
+      grid.innerHTML = '<p style="font-size:.82rem;color:var(--text2);grid-column:1/-1">Noch keine Inserate von diesem Suchagenten gefunden.</p>';
+      return;
+    }
+    listings.forEach(l => grid.appendChild(buildListCard(l)));
+  });
+
   div.querySelector('[data-run]').addEventListener('click', async () => {
     const btn = div.querySelector('[data-run]');
     btn.disabled = true; btn.textContent = '⟳ Lädt…';
@@ -1122,6 +1659,22 @@ function buildJobCard(job) {
     toast(r.message || '⟳ Job gestartet');
     btn.disabled = false; btn.textContent = '⟳ Jetzt abrufen';
     setTimeout(() => loadJobs(), 3000);
+  });
+  div.querySelector('[data-reset]').addEventListener('click', async () => {
+    const confirmed = confirm(
+      `„${job.label}" zurücksetzen?\n\nAlle bisher von diesem Suchagenten gefundenen Inserate werden gelöscht (inkl. Bewertungen/Notizen dazu), danach wird sofort neu gescannt. Das ist sinnvoll nach einem Fix am Scraper, um veraltete/fehlerhafte Daten loszuwerden.`
+    );
+    if (!confirmed) return;
+    const btn = div.querySelector('[data-reset]');
+    btn.disabled = true; btn.textContent = '🔄 Setze zurück…';
+    const r = await api(`/api/jobs/${job.id}/reset`, { method:'POST' });
+    if (r.success) {
+      toast(r.message || `✓ ${r.removed} Inserate entfernt, wird neu gescannt…`);
+      setTimeout(() => loadJobs(), 3000);
+    } else {
+      toast('❌ ' + (r.error || 'Fehler'));
+      btn.disabled = false; btn.textContent = '🔄 Zurücksetzen';
+    }
   });
   div.querySelector('[data-toggle]').addEventListener('click', async () => {
     await api(`/api/jobs/${job.id}/toggle`, { method:'PATCH' });
@@ -1233,8 +1786,16 @@ async function loadSettings() {
 
   // Notification toggles
   $id('notify-email').checked = !!me.notify_email;
-  $id('notify-match').checked = !!me.notify_match;
-  $id('notify-new').checked   = !!me.notify_new;
+
+  // Per-type/per-channel matrix
+  const matrix = me.notify_matrix || {};
+  document.querySelectorAll('.notify-matrix-row').forEach(row => {
+    const type = row.dataset.type;
+    row.querySelectorAll('input[data-channel]').forEach(cb => {
+      const channel = cb.dataset.channel;
+      cb.checked = !!matrix[type]?.[channel];
+    });
+  });
 
   // ntfy fields
   $id('ntfy-topic').value  = me.ntfy_topic  || '';
@@ -1296,9 +1857,24 @@ $id('save-password-btn').addEventListener('click', async () => {
   setOk('settings-pw-ok','✓ Passwort geändert'); toast('✅ Passwort geändert');
 });
 
+// Reads the current state of all matrix checkboxes into a plain object
+// like { match: {email,push,ntfy}, new: {...}, nudge: {...}, change: {...} }
+function readMatrixFromUI() {
+  const matrix = {};
+  document.querySelectorAll('.notify-matrix-row').forEach(row => {
+    const type = row.dataset.type;
+    matrix[type] = {};
+    row.querySelectorAll('input[data-channel]').forEach(cb => {
+      matrix[type][cb.dataset.channel] = cb.checked;
+    });
+  });
+  return matrix;
+}
+
 // Notification toggles save on change
-['notify-email','notify-match','notify-new'].forEach(id => {
-  $id(id).addEventListener('change', saveNotifySettings);
+$id('notify-email').addEventListener('change', saveNotifySettings);
+document.querySelectorAll('.notify-matrix-row input[data-channel]').forEach(cb => {
+  cb.addEventListener('change', saveNotifySettings);
 });
 
 // Digest interval buttons
@@ -1316,12 +1892,11 @@ $id('save-ntfy-btn').addEventListener('click', async () => {
   const d = await api('/api/user/notifications', { method:'PUT', body:{
     notify_email: $id('notify-email').checked ? 1 : 0,
     notify_push:  1,
-    notify_match: $id('notify-match').checked ? 1 : 0,
-    notify_new:   $id('notify-new').checked   ? 1 : 0,
     notify_digest_interval: document.querySelector('.digest-btn.active')?.dataset.interval || 'instant',
     ntfy_topic:       $id('ntfy-topic').value.trim(),
     ntfy_server:      $id('ntfy-server').value.trim(),
     notify_threshold: parseInt($id('notify-threshold')?.value) || 1,
+    notify_matrix:    readMatrixFromUI(),
   }});
   if (d.success) { setOk('ntfy-ok','✓ Gespeichert'); toast('✅ ntfy gespeichert'); }
 });
@@ -1330,14 +1905,13 @@ async function saveNotifySettings() {
   const d = await api('/api/user/notifications', { method:'PUT', body:{
     notify_email:           $id('notify-email').checked ? 1 : 0,
     notify_push:            1,
-    notify_match:           $id('notify-match').checked ? 1 : 0,
-    notify_new:             $id('notify-new').checked   ? 1 : 0,
     notify_digest_interval: document.querySelector('.digest-btn.active')?.dataset.interval || 'instant',
     ntfy_topic:             $id('ntfy-topic').value.trim(),
     ntfy_server:            $id('ntfy-server').value.trim(),
     notify_threshold:       parseInt($id('notify-threshold')?.value) || 1,
+    notify_matrix:          readMatrixFromUI(),
   }});
-  if (d.success) setOk('notify-ok','✓ Gespeichert');
+  if (d.success) setOk('notify-matrix-ok','✓ Gespeichert');
 }
 
 // ── Web Push ──────────────────────────────────────────────
@@ -1484,6 +2058,27 @@ $id('admin-users-btn')?.addEventListener('click', async () => {
   });
 });
 
+// Opens the detail view for a listing referenced by a shared link
+// (?listing=<id> in the URL), then cleans the URL so a refresh doesn't
+// re-trigger it. Works for any listing the current user can technically
+// see via GET /api/listings/:id (bypasses the normal swipe-queue
+// visibility scoping — see that endpoint's comment for why).
+async function openSharedListingFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const sharedId = params.get('listing');
+  if (!sharedId) return;
+
+  // Strip the param immediately regardless of outcome, so the URL is
+  // clean and a page refresh won't keep re-opening the same listing.
+  params.delete('listing');
+  const cleanUrl = location.pathname + (params.toString() ? `?${params}` : '') + location.hash;
+  history.replaceState({}, '', cleanUrl);
+
+  const d = await api(`/api/listings/${sharedId}`);
+  if (d.error || !d.listing) { toast('❌ Geteiltes Inserat nicht gefunden'); return; }
+  detailView.open(d.listing, { fromSwipe: true });
+}
+
 // ══════════════════════════════════════════════════════════
 //  INIT
 // ══════════════════════════════════════════════════════════
@@ -1495,6 +2090,7 @@ $id('admin-users-btn')?.addEventListener('click', async () => {
     showScreen('app-screen');
     await loadGroups();
     loadSwipeQueue();
+    openSharedListingFromUrl();
   } else {
     showScreen('auth-screen');
   }
