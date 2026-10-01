@@ -870,6 +870,12 @@ a { color:var(--accent); text-decoration:none; }
   transition:background .15s;
 }
 .detail-original-link:hover { background:rgba(232,201,122,.08); }
+.detail-report-btn {
+  background:transparent; border:1px solid var(--border); border-radius:11px;
+  padding:11px; font-size:.82rem; color:var(--text2); cursor:pointer;
+  transition:background .15s, border-color .15s, color .15s; text-align:center;
+}
+.detail-report-btn:hover { background:rgba(240,80,96,.08); border-color:rgba(240,80,96,.4); color:var(--dislike); }
 
 /* ── Swipe actions (only shown when opened from the Swipe page) ── */
 .detail-swipe-actions {
