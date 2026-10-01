@@ -535,6 +535,35 @@ function buildSwipeCard(listing) {
   return card;
 }
 
+// ── Shared card-menu item builders ─────────────────────────
+// Both the list-card menu (Bewertet/Meine Inserate) and the group-results
+// menu render the same "common actions" (contact toggle, report offline).
+// Defining each entry's markup ONCE here means a new shared menu item only
+// has to be added in a single place, instead of being copied into every
+// menu template (which is how the report-offline button previously got
+// forgotten in the group view).
+//
+// The two menus are wired differently — the list-card menu uses per-button
+// listeners keyed on data-menu-action, the group menu uses event delegation
+// keyed on dedicated data-* attributes — so the builder takes a `ctx`
+// ('list' | 'group') and emits exactly the attribute set that context's
+// existing handler already listens for. Adding a shared item = editing this
+// one function.
+function sharedCardMenuHtml(id, contacted, ctx) {
+  const contactLabel = contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren';
+  if (ctx === 'group') {
+    return [
+      `<button data-contact-toggle data-listing="${id}">${contactLabel}</button>`,
+      `<button data-report-offline data-listing="${id}">🚫 Als offline melden</button>`,
+    ].join('\n');
+  }
+  // ctx === 'list'
+  return [
+    `<button data-menu-action="contact-toggle">${contactLabel}</button>`,
+    `<button data-menu-action="report-offline">🚫 Als offline melden</button>`,
+  ].join('\n');
+}
+
 function buildListCard(listing, opts = {}) {
   const images = parseImages(listing);
   const hasImg = images[0]?.startsWith('http');
@@ -565,8 +594,9 @@ function buildListCard(listing, opts = {}) {
     <button class="card-menu-btn" data-menu-toggle title="Optionen">⋮</button>
     <div class="card-menu" data-menu style="display:none">
       ${!opts.isArchive ? `<button data-menu-action="unswipe">↩ Bewertung zurückziehen</button>` : ''}
-      <button data-menu-action="contact-toggle">${listing.contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}</button>
-      ${!opts.isArchive ? `<button data-menu-action="report-offline">🚫 Als offline melden</button>` : ''}
+      ${!opts.isArchive
+        ? sharedCardMenuHtml(listing.id, listing.contacted, 'list')
+        : `<button data-menu-action="contact-toggle">${listing.contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}</button>`}
       ${canChangeVisibility ? `
       <div class="card-menu-divider"></div>
       <div class="card-menu-section-label">Sichtbarkeit (${esc(visLabel)})</div>
@@ -1355,10 +1385,7 @@ async function openGroupDetail(group) {
             <button data-rerate-action="dislike"   data-listing="${r.id}">✕ Nein</button>
             <button data-rerate-action="remove"    data-listing="${r.id}">↩ Zurückziehen</button>
             <div class="card-menu-divider"></div>
-            <button data-contact-toggle data-listing="${r.id}">
-              ${r.group_contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}
-            </button>
-            <button data-report-offline data-listing="${r.id}">🚫 Als offline melden</button>
+            ${sharedCardMenuHtml(r.id, r.group_contacted, 'group')}
           </div>
           ${hasImg
             ? `<img class="group-listing-img" src="${esc(imgs[0])}" onclick="window.__lb && window.__lb.open(${JSON.stringify(imgs).replace(/"/g,'&quot;')})" style="cursor:pointer" />`
