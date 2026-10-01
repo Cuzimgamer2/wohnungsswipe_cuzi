@@ -467,6 +467,25 @@ $id('detail-btn-skip').onclick = () => {
 };
 $id('detail-btn-undo').onclick = () => { undoLastSwipe(); detailView.close(); };
 
+$id('detail-report-btn').onclick = async () => {
+  const listing = detailView.listing;
+  if (!listing) return;
+  if (!confirm(`„${listing.title}" als offline melden?\n\nDas Inserat wird ins Archiv verschoben. Falls es über einen Suchagenten kam, wird dieser direkt neu durchsucht, um weitere nicht mehr verfügbare Inserate aufzuräumen.`)) return;
+  const r = await api(`/api/listings/${listing.id}/report-offline`, { method: 'POST' });
+  if (r.success) {
+    toast(r.jobTriggered ? '🚫 Gemeldet – Suchagent wird neu durchsucht' : '🚫 Als offline gemeldet');
+    state.swipeQueue = state.swipeQueue.filter(l => l.id !== listing.id);
+    detailView.close();
+    // Refresh whatever view is currently active so the listing disappears
+    const active = document.querySelector('.view.active')?.id;
+    if (active === 'view-swipe')  renderStack();
+    if (active === 'view-rated')  loadRated();
+    if (active === 'view-add')    loadMyAddedListings?.();
+  } else {
+    toast('❌ ' + (r.error || 'Fehler'));
+  }
+};
+
 // ══════════════════════════════════════════════════════════
 //  CARD BUILDERS
 // ══════════════════════════════════════════════════════════
@@ -516,6 +535,35 @@ function buildSwipeCard(listing) {
   return card;
 }
 
+// ── Shared card-menu item builders ─────────────────────────
+// Both the list-card menu (Bewertet/Meine Inserate) and the group-results
+// menu render the same "common actions" (contact toggle, report offline).
+// Defining each entry's markup ONCE here means a new shared menu item only
+// has to be added in a single place, instead of being copied into every
+// menu template (which is how the report-offline button previously got
+// forgotten in the group view).
+//
+// The two menus are wired differently — the list-card menu uses per-button
+// listeners keyed on data-menu-action, the group menu uses event delegation
+// keyed on dedicated data-* attributes — so the builder takes a `ctx`
+// ('list' | 'group') and emits exactly the attribute set that context's
+// existing handler already listens for. Adding a shared item = editing this
+// one function.
+function sharedCardMenuHtml(id, contacted, ctx) {
+  const contactLabel = contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren';
+  if (ctx === 'group') {
+    return [
+      `<button data-contact-toggle data-listing="${id}">${contactLabel}</button>`,
+      `<button data-report-offline data-listing="${id}">🚫 Als offline melden</button>`,
+    ].join('\n');
+  }
+  // ctx === 'list'
+  return [
+    `<button data-menu-action="contact-toggle">${contactLabel}</button>`,
+    `<button data-menu-action="report-offline">🚫 Als offline melden</button>`,
+  ].join('\n');
+}
+
 function buildListCard(listing, opts = {}) {
   const images = parseImages(listing);
   const hasImg = images[0]?.startsWith('http');
@@ -546,7 +594,9 @@ function buildListCard(listing, opts = {}) {
     <button class="card-menu-btn" data-menu-toggle title="Optionen">⋮</button>
     <div class="card-menu" data-menu style="display:none">
       ${!opts.isArchive ? `<button data-menu-action="unswipe">↩ Bewertung zurückziehen</button>` : ''}
-      <button data-menu-action="contact-toggle">${listing.contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}</button>
+      ${!opts.isArchive
+        ? sharedCardMenuHtml(listing.id, listing.contacted, 'list')
+        : `<button data-menu-action="contact-toggle">${listing.contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}</button>`}
       ${canChangeVisibility ? `
       <div class="card-menu-divider"></div>
       <div class="card-menu-section-label">Sichtbarkeit (${esc(visLabel)})</div>
@@ -645,6 +695,17 @@ function buildListCard(listing, opts = {}) {
           }
         } else {
           noteWrap.classList.toggle('open');
+        }
+      } else if (action === 'report-offline') {
+        if (!confirm(`„${listing.title}" als offline melden?\n\nDas Inserat wird ins Archiv verschoben. Falls es über einen Suchagenten kam, wird dieser direkt neu durchsucht, um weitere nicht mehr verfügbare Inserate aufzuräumen.`)) return;
+        const r = await api(`/api/listings/${listing.id}/report-offline`, { method: 'POST' });
+        if (r.success) {
+          div.style.opacity = '0'; div.style.transition = 'opacity .3s';
+          setTimeout(() => div.remove(), 280);
+          toast(r.jobTriggered ? '🚫 Gemeldet – Suchagent wird neu durchsucht' : '🚫 Als offline gemeldet');
+          state.swipeQueue = [];
+        } else {
+          toast('❌ ' + (r.error || 'Fehler'));
         }
       }
     });
@@ -798,6 +859,50 @@ async function loadSwipeQueue() {
   // Show badge on tab if there are unswiped listings
   updateSwipeBadge(state.swipeQueue.length);
   renderStack();
+  prefetchUpcomingImages();
+}
+
+// ── Bounded-concurrency image prefetcher ───────────────────
+// On a slow/flaky connection, swiping stutters because the next card's
+// photos only start downloading the moment it becomes visible. This warms
+// the browser cache for the FIRST image of the next few queued listings in
+// the background, but caps how many download at once so we never saturate a
+// weak connection (which would make the *current* card's gallery load even
+// slower). Fire-and-forget: failures are ignored, already-cached images
+// resolve instantly, and the set of fetched URLs is remembered so we never
+// re-request the same image.
+const PREFETCH_AHEAD       = 5;   // how many upcoming listings to warm
+const PREFETCH_CONCURRENCY = 2;   // max simultaneous downloads
+const _prefetchedUrls = new Set();
+
+function prefetchUpcomingImages() {
+  // Collect the first image of the next PREFETCH_AHEAD listings (skipping
+  // the top card, whose image is loading anyway), de-duplicated.
+  const urls = [];
+  for (const listing of state.swipeQueue.slice(1, 1 + PREFETCH_AHEAD)) {
+    const imgs = parseImages(listing);
+    const first = imgs[0];
+    if (first && first.startsWith('http') && !_prefetchedUrls.has(first)) {
+      _prefetchedUrls.add(first);
+      urls.push(first);
+    }
+  }
+  if (!urls.length) return;
+
+  // Simple worker-pool: PREFETCH_CONCURRENCY workers pull from the queue.
+  let idx = 0;
+  const worker = async () => {
+    while (idx < urls.length) {
+      const myIdx = idx++;
+      if (myIdx >= urls.length) break;
+      await new Promise(resolve => {
+        const img = new Image();
+        img.onload = img.onerror = () => resolve();
+        img.src = urls[myIdx];
+      });
+    }
+  };
+  for (let w = 0; w < PREFETCH_CONCURRENCY; w++) worker();
 }
 
 function updateSwipeBadge(count) {
@@ -1024,6 +1129,7 @@ async function doSwipe(listing, action) {
   // Trigger stack update right away – the flying card is still in DOM
   // renderStack will skip it because it has fly-* class
   renderStack();
+  prefetchUpcomingImages();
 
   // Remove the card after animation completes
   setTimeout(() => { card.remove(); }, 420);
@@ -1279,9 +1385,7 @@ async function openGroupDetail(group) {
             <button data-rerate-action="dislike"   data-listing="${r.id}">✕ Nein</button>
             <button data-rerate-action="remove"    data-listing="${r.id}">↩ Zurückziehen</button>
             <div class="card-menu-divider"></div>
-            <button data-contact-toggle data-listing="${r.id}">
-              ${r.group_contacted ? '✓ Angeschrieben (Notiz bearbeiten)' : '📬 Als angeschrieben markieren'}
-            </button>
+            ${sharedCardMenuHtml(r.id, r.group_contacted, 'group')}
           </div>
           ${hasImg
             ? `<img class="group-listing-img" src="${esc(imgs[0])}" onclick="window.__lb && window.__lb.open(${JSON.stringify(imgs).replace(/"/g,'&quot;')})" style="cursor:pointer" />`
@@ -1438,6 +1542,26 @@ async function openGroupDetail(group) {
         }
       } else {
         card?.querySelector('[data-note-wrap]')?.classList.toggle('open');
+      }
+      return;
+    }
+
+    // Report-offline chosen from the menu
+    const reportBtn = e.target.closest('[data-report-offline]');
+    if (reportBtn) {
+      e.stopPropagation();
+      const lid  = parseInt(reportBtn.dataset.listing);
+      const menu = reportBtn.closest('.card-menu');
+      menu.style.display = 'none';
+      const card = detailEl.querySelector(`.group-listing-card[data-listing-id="${lid}"]`);
+      const titleText = card?.querySelector('.group-listing-title')?.textContent?.trim() || 'Dieses Inserat';
+      if (!confirm(`„${titleText}" als offline melden?\n\nDas Inserat wird ins Archiv verschoben und verschwindet aus der Gruppenansicht. Falls es über einen Suchagenten kam, wird dieser direkt neu durchsucht.`)) return;
+      const r = await api(`/api/listings/${lid}/report-offline`, { method: 'POST' });
+      if (r.success) {
+        toast(r.jobTriggered ? '🚫 Gemeldet – Suchagent wird neu durchsucht' : '🚫 Als offline gemeldet');
+        setTimeout(() => openGroupDetail(group), 600);
+      } else {
+        toast('❌ ' + (r.error || 'Fehler'));
       }
       return;
     }

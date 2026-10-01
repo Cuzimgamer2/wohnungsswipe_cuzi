@@ -854,6 +854,34 @@ app.delete('/api/listings/swipe/:id', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+// User-reported offline: lets anyone flag a listing they notice is dead
+// (expired, rented, deleted on the source site) without waiting for the
+// 6-hour auto status check. Marks it offline + archives it immediately,
+// and re-triggers the source search agent in the background so other dead
+// listings from the same job get cleared out in the same pass (the agent's
+// own redirect/404 detection does the verification — we don't blindly
+// trust a single user's report to permanently kill the listing for
+// everyone, we just archive it from the swipe/rated views right away).
+app.post('/api/listings/:id/report-offline', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id);
+  const listing = dbGet('SELECT * FROM listings WHERE id=?', [id]);
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+
+  dbRun("UPDATE listings SET status='offline' WHERE id=?", [id]);
+  try { dbRun("INSERT OR IGNORE INTO archive_notes (listing_id,reason) VALUES (?,?)", [id, 'reported']); } catch (_) {}
+  saveDb();
+  console.log(`[Report] Nutzer ${req.session.userId} meldete Inserat ${id} ("${listing.title}") als offline`);
+
+  // Re-trigger the source agent in the background to clear sibling dead
+  // listings too. Only when the listing actually came from an agent.
+  let jobTriggered = false;
+  if (listing.source_job_id) {
+    const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [listing.source_job_id]);
+    if (job) { jobTriggered = true; runJob(job).catch(() => {}); }
+  }
+  res.json({ success: true, jobTriggered });
+});
+
 app.get('/api/listings/rated', requireAuth, (req, res) => {
   const listings = dbAll(`
     SELECT l.*, s.action as my_swipe,

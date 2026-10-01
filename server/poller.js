@@ -32,11 +32,22 @@ function detectPlatform(url) {
 }
 
 async function fetchPage(url, timeoutMs = 18000, allowedFailCodes = []) {
+  const res = await fetchPageRaw(url, timeoutMs, allowedFailCodes);
+  return res.text;
+}
+
+// Like fetchPage but also returns the FINAL url after any redirects, so
+// callers can detect when a listing URL silently redirected somewhere else
+// (Kleinanzeigen bounces expired ads to a category/search page with HTTP
+// 200 instead of returning a 404, which would otherwise look "alive").
+async function fetchPageRaw(url, timeoutMs = 18000, allowedFailCodes = []) {
   const res = await fetch(url, { headers: HEADERS, timeout: timeoutMs });
   if (!res.ok && !allowedFailCodes.includes(res.status)) {
     throw new Error(`HTTP ${res.status}`);
   }
-  return res.text();
+  const text = await res.text();
+  // node-fetch exposes the final URL after following redirects as res.url
+  return { text, finalUrl: res.url || url };
 }
 
 // ── Extract listing URLs from search results page ──────────
@@ -478,10 +489,13 @@ async function scrapeListing(url) {
   };
 
   let html;
+  let finalUrl = url;
   try {
     // For SPA platforms, allow 403 responses – they still contain meta tags in the HTML
     const allowedCodes = (platform === 'rentola' || platform === 'meinestadt') ? [403] : [];
-    html = await fetchPage(url, 18000, allowedCodes);
+    const raw = await fetchPageRaw(url, 18000, allowedCodes);
+    html = raw.text;
+    finalUrl = raw.finalUrl;
   }
   catch (e) {
     // HTTP 404 / 410 = definitely offline; 403 for non-SPA = likely offline
@@ -491,6 +505,26 @@ async function scrapeListing(url) {
     d.title = 'Inserat (nicht ladbar)';
     d.description = `Fehler: ${e.message}`;
     return d;
+  }
+
+  // Expired-listing redirect check: Kleinanzeigen (and similar sites) don't
+  // always 404 a removed ad — they quietly 200-redirect it to a category or
+  // search-results page. We started at a specific /s-anzeige/…/<id> listing
+  // URL; if the final URL after redirects is no longer an /s-anzeige/ page
+  // (or points at a *different* ad id), the original ad is gone → offline.
+  if (platform === 'kleinanzeigen') {
+    const startedOnListing = /\/s-anzeige\//.test(url);
+    const idMatch = url.match(/(\d{6,})-\d+-\d+/);
+    const startId = idMatch ? idMatch[1] : null;
+    const stillOnListing = /\/s-anzeige\//.test(finalUrl);
+    const finalIdMatch = finalUrl.match(/(\d{6,})-\d+-\d+/);
+    const finalId = finalIdMatch ? finalIdMatch[1] : null;
+    if (startedOnListing && (!stillOnListing || (startId && finalId && startId !== finalId))) {
+      d.status = 'offline';
+      d.title = d.title || 'Inserat nicht mehr verfügbar';
+      d.description = `Anzeige nicht mehr verfügbar (weitergeleitet zu ${finalUrl})`;
+      return d;
+    }
   }
 
   const $ = cheerio.load(html);
