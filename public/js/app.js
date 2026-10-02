@@ -334,6 +334,22 @@ const detailView = {
     this._renderGallery();
     $id('detail-view').style.display = 'flex';
     document.addEventListener('keydown', detailView._key);
+
+    // Refresh the listing once when opening details. The swipe queue can
+    // contain an older/minimal object; the API response is the authoritative
+    // DB row and includes the complete image gallery.
+    const openedId = listing.id;
+    if (openedId) {
+      api('/api/listings/' + encodeURIComponent(openedId)).then(d => {
+        if (d?.listing && this.listing?.id === openedId) {
+          this.listing = d.listing;
+          this.imgs = parseImages(d.listing);
+          this.idx = Math.min(this.idx, Math.max(0, this.imgs.length - 1));
+          $id('detail-title').textContent = d.listing.title || 'Inserat';
+          this._renderGallery();
+        }
+      }).catch(() => {});
+    }
   },
 
   close() {
@@ -1222,23 +1238,27 @@ $id('add-listing-btn').addEventListener('click', async () => {
 
 $id('search-scrape-btn').addEventListener('click', async () => {
   const url = $id('job-url').value.trim();
+  const limitInput = parseInt($id('search-scrape-limit').value, 10);
+  const limit = Math.max(1, Math.min(50, Number.isFinite(limitInput) ? limitInput : 10));
+
   clr('job-error');
   if (!url.startsWith('http')) return setErr('job-error', 'Gültige Such-URL erforderlich');
 
   const btn = $id('search-scrape-btn');
   btn.disabled = true;
-  btn.textContent = '⏳ Suche wird geladen…';
+  btn.textContent = `⏳ ${limit} Inserate werden geladen…`;
 
   const d = await api('/api/search/scrape', {
     method: 'POST',
-    body: { url, limit: 10 }
+    body: { url, limit }
   });
 
   btn.disabled = false;
-  btn.textContent = '🔎 Erste 10 Inserate dieser Suche laden';
+  btn.textContent = '🔎 Inserate laden';
 
   if (d.error) return setErr('job-error', '❌ ' + d.error);
-  toast(`✅ ${d.added} Inserate importiert (${d.found} gefunden)`);
+  const updated = d.updated ? ` / ${d.updated} aktualisiert` : '';
+  toast(`✅ ${d.added} Inserate verarbeitet (${d.found} gefunden${updated})`);
   await loadSwipeQueue();
 });
 // Show/hide group selector based on visibility choice (manual add page)
