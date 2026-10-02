@@ -632,15 +632,40 @@ app.post('/api/search/scrape', requireAuth, async (req, res) => {
   if (!url || !/^https?:\/\//i.test(url))
     return res.status(400).json({ error: 'Gültige Such-URL erforderlich' });
 
-  const max = Math.max(1, Math.min(10, parseInt(limit) || 10));
+  const max = Math.max(1, Math.min(50, parseInt(limit) || 10));
 
   try {
     const result = await scrapeSearchResults(url, max);
     const added = [];
 
+    let updatedCount = 0;
+
     for (const data of result.listings) {
-      const inserted = insertListing(data, req.session.userId, null, 'global', null);
-      if (inserted.isNew) {
+      // Re-running a manual search should also refresh already imported
+      // listings, so scraper fixes (e.g. cleaner titles / more images) are
+      // immediately visible without having to delete the old listing.
+      const existing = dbGet('SELECT id FROM listings WHERE url=?', [data.url]);
+
+      if (existing) {
+        dbRun(
+          `UPDATE listings SET title=?, price=?, price_cold=?, size=?, location=?,
+             rooms=?, image_url=?, images_json=?, tags_json=?, description=?,
+             platform=?, status=?, nebenkosten=?, heizkosten=?, kaution=?,
+             available_from=?, property_type=?, latitude=?, longitude=?
+           WHERE id=?`,
+          [data.title||'', data.price||'', data.price_cold||'', data.size||'',
+           data.location||'', data.rooms||'', data.image_url||'', data.images_json||'[]',
+           data.tags_json||'[]', data.description||'', data.platform||'unbekannt',
+           data.status||'active', data.nebenkosten||'', data.heizkosten||'',
+           data.kaution||'', data.available_from||'', data.property_type||'',
+           Number.isFinite(data.latitude) ? data.latitude : null,
+           Number.isFinite(data.longitude) ? data.longitude : null, existing.id]
+        );
+        const listing = dbGet('SELECT * FROM listings WHERE id=?', [existing.id]);
+        if (listing) added.push(listing);
+        updatedCount++;
+      } else {
+        const inserted = insertListing(data, req.session.userId, null, 'global', null);
         const listing = dbGet('SELECT * FROM listings WHERE id=?', [inserted.id]);
         if (listing) added.push(listing);
       }
@@ -651,6 +676,7 @@ app.post('/api/search/scrape', requireAuth, async (req, res) => {
       success: true,
       found: result.urls.length,
       added: added.length,
+      updated: updatedCount,
       listings: added,
     });
   } catch (e) {
