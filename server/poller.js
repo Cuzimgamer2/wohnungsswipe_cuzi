@@ -638,21 +638,18 @@ async function scrapeListing(url) {
   let immoweltMobile$ = null;
   if (platform === 'immowelt') {
     try {
-      const existingEmbedded = collectImmoweltEmbeddedImages($, html);
-      if (existingEmbedded.length < 2) {
-        const mobileUrl = new URL(url);
-        mobileUrl.searchParams.set('app', '1');
-        const mobileRaw = await fetchPageRaw(
-          mobileUrl.toString(),
-          22000,
-          [403],
-          IMMOWELT_MOBILE_HEADERS
-        );
-        if (mobileRaw.text && mobileRaw.text.length > 1000) {
-          immoweltMobileHtml = mobileRaw.text;
-          immoweltMobile$ = cheerio.load(immoweltMobileHtml);
-          console.log(`[Immowelt] Mobile-Detail geladen: ${url}`);
-        }
+      const mobileUrl = new URL(url);
+      mobileUrl.searchParams.set('app', '1');
+      const mobileRaw = await fetchPageRaw(
+        mobileUrl.toString(),
+        22000,
+        [403],
+        IMMOWELT_MOBILE_HEADERS
+      );
+      if (mobileRaw.text && mobileRaw.text.length > 1000) {
+        immoweltMobileHtml = mobileRaw.text;
+        immoweltMobile$ = cheerio.load(immoweltMobileHtml);
+        console.log(`[Immowelt] Mobile-Detail geladen: ${url}`);
       }
     } catch (e) {
       console.warn(`[Immowelt] Mobile-Detail fehlgeschlagen für ${url}: ${e.message}`);
