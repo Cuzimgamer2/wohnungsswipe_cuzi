@@ -69,11 +69,19 @@ function extractListingUrls(html, searchUrl, maxResults = 50) {
       if (href.startsWith('http') && href.includes('/expose/')) urls.add(href.split('?')[0]);
     });
   } else if (platform === 'immowelt') {
-    $('a[href*="/expose/"]').each((_, el) => {
+    $('a[href*="/expose/"], a[href*="/expose"]').each((_, el) => {
       let href = $(el).attr('href') || '';
       if (href.startsWith('/')) href = 'https://www.immowelt.de' + href;
-      if (href.startsWith('http')) urls.add(href.split('?')[0]);
+      if (href.startsWith('http') && /immowelt\.de\/expose\//i.test(href))
+        urls.add(href.split('?')[0]);
     });
+
+    // Current Immowelt pages can also embed result URLs in JSON/script state
+    // without rendering them as normal <a> elements.
+    const raw = html.replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
+    const re = /https?:\\/\\/(?:www\\.)?immowelt\\.de\\/expose\\/[a-z0-9-]+/gi;
+    let m;
+    while ((m = re.exec(raw))) urls.add(m[0].replace(/\\/g, '').split('?')[0]);
   } else if (platform === 'rentola') {
     $('a[href*="/listings/"]').each((_, el) => {
       let href = $(el).attr('href') || '';
@@ -203,6 +211,14 @@ function extractKleinanzeigenAusstattung($) {
 function collectImages($, selectors) {
   const set = new Set();
 
+  const add = src => {
+    if (!src) return;
+    src = String(src).trim().replace(/\\u0026/g, '&').replace(/\\\\\//g, '/');
+    if (!src.startsWith('http')) return;
+    if (/logo|icon|avatar|favicon/i.test(src)) return;
+    set.add(src);
+  };
+
   selectors.forEach(sel => {
     $(sel).each((_, el) => {
       const candidates = [
@@ -216,14 +232,40 @@ function collectImages($, selectors) {
           .filter(Boolean))
       ].filter(Boolean);
 
-      for (const src of candidates) {
-        if (!src.startsWith('http')) continue;
-        if (/logo|icon|avatar|favicon/i.test(src)) continue;
-        // Gallery/CDN URLs frequently have no file extension (especially
-        // Immowelt). Trust the selector and keep those URLs as well.
-        set.add(src);
-      }
+      candidates.forEach(add);
     });
+  });
+
+  return [...set];
+}
+
+// Extract image URLs from serialized page state. Immowelt exposes its gallery
+// as an array of image objects in embedded application JSON; relying only on
+// rendered <img> tags can therefore miss lazy-loaded photos.
+function collectImmoweltEmbeddedImages($, html) {
+  const set = new Set();
+  const add = src => {
+    if (!src) return;
+    src = String(src).trim()
+      .replace(/\\u0026/g, '&')
+      .replace(/\\\//g, '/')
+      .replace(/\\\\/g, '/');
+    if (/^https?:\/\/mms\.immowelt\.de\//i.test(src)) set.add(src);
+  };
+
+  // HTML attributes / inline JSON.
+  const raw = String(html || '').replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
+  const re = /https?:\\/\\/mms\.immowelt\.de\\/[^"'\\s<>\\\\]+/gi;
+  let m;
+  while ((m = re.exec(raw))) add(m[0]);
+
+  // Also inspect script text independently; this catches escaped JSON where
+  // the URL is not present as a normal DOM attribute.
+  $('script').each((_, el) => {
+    const text = $(el).html() || '';
+    let x;
+    const rr = /https?:\\/\\/mms\.immowelt\.de\\/[^"'\\s<>\\\\]+/gi;
+    while ((x = rr.exec(text))) add(x[0]);
   });
 
   return [...set];
@@ -722,18 +764,23 @@ async function scrapeListing(url) {
     if (d.size)  titleParts.push(d.size);
     if (titleParts.length) d.title += ' – ' + titleParts.join(' · ');
 
-    const imgs = collectImages($, [
-      '[class*="Gallery"] img',
-      '[class*="gallery"] img',
-      '[class*="Slider"] img',
-      '[class*="slider"] img',
-      'img[src*="mms.immowelt.de"]',
-      'img[data-src*="mms.immowelt.de"]'
-    ]);
+    const imgs = [
+      ...collectImages($, [
+        '[class*="Gallery"] img',
+        '[class*="gallery"] img',
+        '[class*="Slider"] img',
+        '[class*="slider"] img',
+        'img[src*="mms.immowelt.de"]',
+        'img[data-src*="mms.immowelt.de"]',
+        'img[data-lazy-src*="mms.immowelt.de"]'
+      ]),
+      ...collectImmoweltEmbeddedImages($, html)
+    ];
     const og = $('meta[property="og:image"]').attr('content') || '';
-    if (og && !imgs.includes(og)) imgs.unshift(og);
-    d.images_json = JSON.stringify([...new Set(imgs)]);
-    d.image_url   = imgs[0] || og;
+    if (og && !imgs.includes(og) && /mms\.immowelt\.de/i.test(og)) imgs.unshift(og);
+    const uniqueImgs = [...new Set(imgs)];
+    d.images_json = JSON.stringify(uniqueImgs);
+    d.image_url   = uniqueImgs[0] || og;
   }
   else if (platform === 'rentola') {
     // Rentola is a Next.js SPA – most content is client-rendered.
@@ -904,10 +951,15 @@ async function checkExistingListings(listings, onStatusChange, onFieldChange) {
 // Fetch a public search-results URL and scrape only the first N listing URLs.
 // This is intentionally separate from a recurring search job.
 async function scrapeSearchResults(searchUrl, limit = 10) {
+  const target = Math.max(1, Math.min(50, parseInt(limit) || 10));
   const searchHtml = await fetchPage(searchUrl, 20000);
-  const urls = extractListingUrls(searchHtml, searchUrl, Math.max(1, Math.min(50, limit)));
 
-  if (!urls.length) {
+  // Get more candidates than requested. If one listing is temporarily
+  // blocked/expired, we try the next candidate instead of silently returning
+  // fewer results than requested.
+  const candidates = extractListingUrls(searchHtml, searchUrl, Math.max(100, target * 4));
+
+  if (!candidates.length) {
     const lc = searchHtml.toLowerCase();
     if (lc.includes('captcha') || lc.includes('robot'))
       throw new Error('CAPTCHA erkannt – bitte die Suche manuell öffnen');
@@ -915,16 +967,43 @@ async function scrapeSearchResults(searchUrl, limit = 10) {
   }
 
   const listings = [];
-  for (const url of urls) {
-    try {
-      listings.push(await scrapeListing(url));
-      await sleep(1200 + Math.random() * 1000);
-    } catch (e) {
-      console.warn(`[Search] Fehler beim Scrapen von ${url}: ${e.message}`);
+  const failed = [];
+
+  for (const url of candidates) {
+    if (listings.length >= target) break;
+
+    let lastError = '';
+    let data = null;
+
+    // Retry each candidate twice after the initial attempt.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        data = await scrapeListing(url);
+        if (!data?.url) throw new Error('Scraper lieferte keine URL');
+        break;
+      } catch (e) {
+        lastError = e.message || String(e);
+        if (attempt < 3) await sleep(900 * attempt);
+      }
     }
+
+    if (data) {
+      listings.push(data);
+    } else {
+      failed.push({ url, error: lastError });
+      console.warn(`[Search] Übersprungen nach 3 Versuchen: ${url} – ${lastError}`);
+    }
+
+    if (listings.length < target) await sleep(1200 + Math.random() * 1000);
   }
 
-  return { urls, listings };
+  return {
+    urls: candidates,
+    listings,
+    failed,
+    requested: target,
+    successful: listings.length
+  };
 }
 
 // ── Main export – poll one search job ─────────────────────
