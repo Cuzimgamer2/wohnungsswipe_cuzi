@@ -6,7 +6,7 @@ Dieser Fork basiert auf **Nicgeon/wohnungsswipe** und enthält zusätzliche Funk
 
 ### Suche & Scraping
 
-- Einmaliges Scrapen einer kompletten Suchergebnisseite über **„Erste 10 Inserate dieser Suche laden“**.
+- Einmaliges Scrapen einer kompletten Suchergebnisseite mit frei wählbarer Anzahl von **1–50 Inseraten**.
 - Neue API: `POST /api/search/scrape`.
 - Der Scraper verarbeitet mehrere Inserate nacheinander statt nur ein einzelnes Inserat.
 - Fehler bei einzelnen Inseraten werden nicht mehr still verworfen:
@@ -17,6 +17,9 @@ Dieser Fork basiert auf **Nicgeon/wohnungsswipe** und enthält zusätzliche Funk
 - Kleine Wartezeiten zwischen Scrape-Versuchen, um die Portale nicht unnötig aggressiv anzufragen.
 - Immowelt-Suchergebnisse werden zusätzlich aus eingebettetem Script-/JSON-State erkannt.
 - Immowelt-Galerien werden gezielt aus `gallery.images` ausgelesen.
+- Für jedes Immowelt-Inserat wird die eigentliche Exposé-URL separat aufgerufen.
+- Zusätzlich wird die Exposé-URL als Immowelt-Mobile-Webview mit `?app=1` und `aviv_client=ios` geladen und mit dem normalen HTML zusammengeführt.
+- Dieser zusätzliche Detail-Request ist absichtlich langsamer, erhöht aber die Chance auf die vollständige Galerie bei lazy geladenen Bildern deutlich.
 - Immowelt-Bilder werden nicht mehr nur anhand einer Dateiendung erkannt, da CDN-URLs auch ohne sichtbare `.jpg`/`.png`-Endung vorkommen können.
 - Mehrere Bildquellen eines Inserats werden zusammengeführt und dedupliziert.
 - Immowelt-URL- und Gallery-RegEx wurden für aktuelle eingebettete Daten angepasst.
@@ -40,12 +43,15 @@ Dieser Fork basiert auf **Nicgeon/wohnungsswipe** und enthält zusätzliche Funk
 
 ### Designs
 
-Es gibt vier auswählbare Designs:
+Es gibt fünf auswählbare Designs:
 
 - **Standard** – ursprüngliches Erscheinungsbild
 - **Hell** – helles Theme
 - **Dunkel** – dunkles Theme
-- **Anti-AI** – bewusst schlichtes, professionelles Interface mit reduzierten Rundungen, Schatten und visuellen Effekten
+- **Anti-AI** – dunkles, zurückhaltendes und professionelles Interface mit reduzierten Rundungen, Schatten und visuellen Effekten
+- **Coastal** – blau/türkise Himmel- und Meerestöne kombiniert mit Sand-/Beige-Akzenten nach dem bereitgestellten Referenzbild
+
+Bei Desktop-Hover über einem Design erscheint eine kleine Vorschau des jeweiligen Seitenstils. Das Profilmenü verwendet außerdem einen sauber zentrierten CSS-Chevron statt eines Textzeichens.
 
 Die Theme-Auswahl wird lokal im Browser gespeichert und auf die gesamte Oberfläche angewendet.
 
