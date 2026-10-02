@@ -19,6 +19,14 @@ const HEADERS = {
   'Cache-Control':   'no-cache',
 };
 
+const IMMOWELT_MOBILE_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+  'Accept': 'text/html,application/xhtml+xml,*/*',
+  'Accept-Language': 'de-DE,de;q=0.9',
+  'Cache-Control': 'no-cache',
+  'Cookie': 'aviv_client=ios',
+};
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── Platform detection ─────────────────────────────────────
@@ -40,8 +48,8 @@ async function fetchPage(url, timeoutMs = 18000, allowedFailCodes = []) {
 // callers can detect when a listing URL silently redirected somewhere else
 // (Kleinanzeigen bounces expired ads to a category/search page with HTTP
 // 200 instead of returning a 404, which would otherwise look "alive").
-async function fetchPageRaw(url, timeoutMs = 18000, allowedFailCodes = []) {
-  const res = await fetch(url, { headers: HEADERS, timeout: timeoutMs });
+async function fetchPageRaw(url, timeoutMs = 18000, allowedFailCodes = [], requestHeaders = HEADERS) {
+  const res = await fetch(url, { headers: requestHeaders, timeout: timeoutMs });
   if (!res.ok && !allowedFailCodes.includes(res.status)) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -620,6 +628,37 @@ async function scrapeListing(url) {
 
   const $ = cheerio.load(html);
 
+  // Immowelt frequently serves only the first gallery image in the normal
+  // desktop HTML. A second request using the mobile webview variant
+  // (?app=1 + aviv_client=ios) exposes the serialized UFRN gallery with the
+  // complete image array. We fetch that detail URL directly for each listing
+  // and merge both documents. This is deliberately slower but much more
+  // reliable than guessing image URLs from the search card.
+  let immoweltMobileHtml = '';
+  let immoweltMobile$ = null;
+  if (platform === 'immowelt') {
+    try {
+      const existingEmbedded = collectImmoweltEmbeddedImages($, html);
+      if (existingEmbedded.length < 2) {
+        const mobileUrl = new URL(url);
+        mobileUrl.searchParams.set('app', '1');
+        const mobileRaw = await fetchPageRaw(
+          mobileUrl.toString(),
+          22000,
+          [403],
+          IMMOWELT_MOBILE_HEADERS
+        );
+        if (mobileRaw.text && mobileRaw.text.length > 1000) {
+          immoweltMobileHtml = mobileRaw.text;
+          immoweltMobile$ = cheerio.load(immoweltMobileHtml);
+          console.log(`[Immowelt] Mobile-Detail geladen: ${url}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[Immowelt] Mobile-Detail fehlgeschlagen für ${url}: ${e.message}`);
+    }
+  }
+
   // Remove any content belonging to OTHER listings (e.g. the "Das könnte
   // dich auch interessieren" carousel) before extracting anything at all,
   // so it can never bleed into this listing's images, tags, or any other
@@ -796,21 +835,36 @@ async function scrapeListing(url) {
     if (d.size)  titleParts.push(d.size);
     if (titleParts.length) d.title += ' – ' + titleParts.join(' · ');
 
-    const imgs = [
-      ...collectImages($, [
-        '[class*="Gallery"] img',
-        '[class*="gallery"] img',
-        '[class*="Slider"] img',
-        '[class*="slider"] img',
-        'img[src*="mms.immowelt.de"]',
-        'img[data-src*="mms.immowelt.de"]',
-        'img[data-lazy-src*="mms.immowelt.de"]'
-      ]),
-      ...collectImmoweltEmbeddedImages($, html)
+    const immoweltSelectors = [
+      '[class*="Gallery"] img',
+      '[class*="gallery"] img',
+      '[class*="Slider"] img',
+      '[class*="slider"] img',
+      'img[src*="mms.immowelt.de"]',
+      'img[data-src*="mms.immowelt.de"]',
+      'img[data-lazy-src*="mms.immowelt.de"]'
     ];
+
+    const imageCandidates = [
+      ...collectImages($, immoweltSelectors),
+      ...collectImmoweltEmbeddedImages($, html),
+    ];
+
+    // Merge the complete gallery from the direct listing page's mobile
+    // representation as well. Immowelt exposes the image objects under
+    // gallery.images in this variant even when desktop HTML contains only
+    // the first visible photo.
+    if (immoweltMobile$) {
+      imageCandidates.push(
+        ...collectImages(immoweltMobile$, immoweltSelectors),
+        ...collectImmoweltEmbeddedImages(immoweltMobile$, immoweltMobileHtml)
+      );
+    }
+
     const og = $('meta[property="og:image"]').attr('content') || '';
-    if (og && !imgs.includes(og) && /mms\.immowelt\.de/i.test(og)) imgs.unshift(og);
-    const uniqueImgs = [...new Set(imgs)];
+    if (og && /mms\.immowelt\.de/i.test(og)) imageCandidates.unshift(og);
+
+    const uniqueImgs = [...new Set(imageCandidates)];
     d.images_json = JSON.stringify(uniqueImgs);
     d.image_url   = uniqueImgs[0] || og;
   }
