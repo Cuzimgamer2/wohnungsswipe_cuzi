@@ -1220,6 +1220,27 @@ $id('add-listing-btn').addEventListener('click', async () => {
   loadMyAddedListings();
 });
 
+$id('search-scrape-btn').addEventListener('click', async () => {
+  const url = $id('job-url').value.trim();
+  clr('job-error');
+  if (!url.startsWith('http')) return setErr('job-error', 'Gültige Such-URL erforderlich');
+
+  const btn = $id('search-scrape-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Suche wird geladen…';
+
+  const d = await api('/api/search/scrape', {
+    method: 'POST',
+    body: { url, limit: 10 }
+  });
+
+  btn.disabled = false;
+  btn.textContent = '🔎 Erste 10 Inserate dieser Suche laden';
+
+  if (d.error) return setErr('job-error', '❌ ' + d.error);
+  toast(`✅ ${d.added} Inserate importiert (${d.found} gefunden)`);
+  await loadSwipeQueue();
+});
 // Show/hide group selector based on visibility choice (manual add page)
 $id('add-visibility').addEventListener('change', () => {
   const isGroup = $id('add-visibility').value === 'group';
