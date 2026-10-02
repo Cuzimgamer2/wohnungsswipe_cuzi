@@ -252,61 +252,95 @@ function collectImages($, selectors) {
 // rendered <img> tags can therefore miss lazy-loaded photos.
 function collectImmoweltEmbeddedImages($, html) {
   const set = new Set();
+
   const add = src => {
     if (!src) return;
     src = String(src).trim()
       .replace(/\\u0026/g, '&')
+      .replace(/\\u002F/gi, '/')
       .replace(/\\\//g, '/')
       .replace(/\\\\/g, '/');
     if (/^https?:\/\/mms\.immowelt\.de\//i.test(src)) set.add(src);
   };
 
-  // The useful URLs live specifically under gallery.images. Do not scan all
-  // mms.immowelt.de URLs because the same CDN also hosts agency logos,
-  // badges and document thumbnails.
-  const raw = String(html || '')
-    .replace(/\\u002F/gi, '/')
-    .replace(/\\\//g, '/');
-
-  const galleryBlock = /["']gallery["']\s*:\s*\{[\s\S]*?["']images["']\s*:\s*\[([\s\S]*?)\]/gi;
-  let block;
-  while ((block = galleryBlock.exec(raw))) {
-    const chunk = block[1];
-    const imageUrls = chunk.match(/https?:\/\/mms\.immowelt\.de\/[^"'\s<>\\]+/gi) || [];
-    imageUrls.forEach(add);
-  }
-
-  // Also parse JSON script blocks where possible and walk only
-  // gallery.images arrays. This handles escaped URLs more reliably.
   const walk = value => {
     if (!value || typeof value !== 'object') return;
+
     if (Array.isArray(value)) {
       value.forEach(walk);
       return;
     }
+
     for (const [key, val] of Object.entries(value)) {
-      if (key.toLowerCase() === 'gallery' && val && typeof val === 'object') {
+      const keyLower = key.toLowerCase();
+
+      if (keyLower === 'gallery' && val && typeof val === 'object') {
         const images = val.images;
         if (Array.isArray(images)) {
           images.forEach(img => {
-            if (img && typeof img === 'object') add(img.url);
+            if (typeof img === 'string') add(img);
+            else if (img && typeof img === 'object') {
+              add(img.url);
+              add(img.src);
+            }
           });
         }
       }
+
+      if (keyLower === 'imageurls' || keyLower === 'image_urls') {
+        if (Array.isArray(val)) val.forEach(add);
+      }
+
+      if (keyLower === 'images' && Array.isArray(val)) {
+        val.forEach(img => {
+          if (typeof img === 'string') add(img);
+          else if (img && typeof img === 'object') add(img.url);
+        });
+      }
+
       walk(val);
     }
   };
 
+  const raw = String(html || '')
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\\//g, '/');
+
+  // Normal JSON script tags, including __NEXT_DATA__.
   $('script').each((_, el) => {
     const text = $(el).html() || '';
     try {
-      const parsed = JSON.parse(text.trim());
-      walk(parsed);
-    } catch (_) {
-      // Not every inline script is JSON; the gallery regex above covers
-      // serialized application state that is embedded in normal JS.
-    }
+      walk(JSON.parse(text.trim()));
+    } catch (_) {}
   });
+
+  // Immowelt's detail payload is usually a JavaScript assignment containing
+  // a DOUBLE-ENCODED JSON string. It is not a normal JSON script tag:
+  // window["__UFRN_LIFECYCLE_SERVERREQUEST__"] = JSON.parse("...");
+  const lifecycleRe =
+    /window\s*\[\s*["']__UFRN_LIFECYCLE_SERVERREQUEST__["']\s*\]\s*=\s*JSON\.parse\("((?:\\.|[^"\\])*)"\)/g;
+
+  let match;
+  while ((match = lifecycleRe.exec(raw))) {
+    try {
+      const decodedJson = JSON.parse('"' + match[1] + '"');
+      walk(JSON.parse(decodedJson));
+    } catch (e) {
+      console.warn('[Immowelt] UFRN-Detaildaten konnten nicht geparst werden:', e.message);
+    }
+  }
+
+  // Fallback for serialized gallery objects not wrapped in the lifecycle
+  // assignment.
+  const galleryBlock =
+    /["']gallery["']\s*:\s*\{[\s\S]*?["']images["']\s*:\s*\[([\s\S]*?)\]/gi;
+
+  while ((match = galleryBlock.exec(raw))) {
+    const chunk = match[1];
+    const imageUrls =
+      chunk.match(/https?:\/\/mms\.immowelt\.de\/[^"'\s<>\\]+/gi) || [];
+    imageUrls.forEach(add);
+  }
 
   return [...set];
 }
