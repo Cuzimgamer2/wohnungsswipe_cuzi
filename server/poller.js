@@ -260,11 +260,11 @@ function collectImmoweltEmbeddedImages($, html) {
     .replace(/\\u002F/gi, '/')
     .replace(/\\\//g, '/');
 
-  const galleryBlock = /["']gallery["']\\s*:\\s*\\{[\\s\\S]*?["']images["']\\s*:\\s*\\[([\\s\\S]*?)\\]/gi;
+  const galleryBlock = /["']gallery["']\s*:\s*\{[\s\S]*?["']images["']\s*:\s*\[([\s\S]*?)\]/gi;
   let block;
   while ((block = galleryBlock.exec(raw))) {
     const chunk = block[1];
-    const imageUrls = chunk.match(/https?:\\/\\/mms\.immowelt\.de\\/[^"'\\s<>\\\\]+/gi) || [];
+    const imageUrls = chunk.match(/https?:\/\/mms\.immowelt\.de\/[^"'\s<>\\]+/gi) || [];
     imageUrls.forEach(add);
   }
 
