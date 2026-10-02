@@ -253,19 +253,51 @@ function collectImmoweltEmbeddedImages($, html) {
     if (/^https?:\/\/mms\.immowelt\.de\//i.test(src)) set.add(src);
   };
 
-  // HTML attributes / inline JSON.
-  const raw = String(html || '').replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
-  const re = /https?:\\/\\/mms\.immowelt\.de\\/[^"'\\s<>\\\\]+/gi;
-  let m;
-  while ((m = re.exec(raw))) add(m[0]);
+  // The useful URLs live specifically under gallery.images. Do not scan all
+  // mms.immowelt.de URLs because the same CDN also hosts agency logos,
+  // badges and document thumbnails.
+  const raw = String(html || '')
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\\//g, '/');
 
-  // Also inspect script text independently; this catches escaped JSON where
-  // the URL is not present as a normal DOM attribute.
+  const galleryBlock = /["']gallery["']\\s*:\\s*\\{[\\s\\S]*?["']images["']\\s*:\\s*\\[([\\s\\S]*?)\\]/gi;
+  let block;
+  while ((block = galleryBlock.exec(raw))) {
+    const chunk = block[1];
+    const imageUrls = chunk.match(/https?:\\/\\/mms\.immowelt\.de\\/[^"'\\s<>\\\\]+/gi) || [];
+    imageUrls.forEach(add);
+  }
+
+  // Also parse JSON script blocks where possible and walk only
+  // gallery.images arrays. This handles escaped URLs more reliably.
+  const walk = value => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    for (const [key, val] of Object.entries(value)) {
+      if (key.toLowerCase() === 'gallery' && val && typeof val === 'object') {
+        const images = val.images;
+        if (Array.isArray(images)) {
+          images.forEach(img => {
+            if (img && typeof img === 'object') add(img.url);
+          });
+        }
+      }
+      walk(val);
+    }
+  };
+
   $('script').each((_, el) => {
     const text = $(el).html() || '';
-    let x;
-    const rr = /https?:\\/\\/mms\.immowelt\.de\\/[^"'\\s<>\\\\]+/gi;
-    while ((x = rr.exec(text))) add(x[0]);
+    try {
+      const parsed = JSON.parse(text.trim());
+      walk(parsed);
+    } catch (_) {
+      // Not every inline script is JSON; the gallery regex above covers
+      // serialized application state that is embedded in normal JS.
+    }
   });
 
   return [...set];
