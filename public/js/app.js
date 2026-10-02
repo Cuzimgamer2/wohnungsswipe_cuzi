@@ -1318,7 +1318,8 @@ $id('search-scrape-btn').addEventListener('click', async () => {
 
   if (d.error) return setErr('job-error', '❌ ' + d.error);
   const updated = d.updated ? ` / ${d.updated} aktualisiert` : '';
-  toast(`✅ ${d.added} Inserate verarbeitet (${d.found} gefunden${updated})`);
+  const failed = d.failed?.length ? ` / ${d.failed.length} fehlgeschlagen` : '';
+  toast(`✅ ${d.successful ?? d.added} Inserate gescraped (${d.added} verarbeitet${updated}${failed})`, failed ? 5000 : 2800);
   await loadSwipeQueue();
 });
 // Show/hide group selector based on visibility choice (manual add page)
