@@ -678,19 +678,62 @@ async function scrapeListing(url) {
     d.image_url   = imgs[0] || $('meta[property="og:image"]').attr('content') || '';
   }
   else if (platform === 'immowelt') {
-    d.title = $('h1').first().text().trim();
+    // Immowelt's current HTML contains a lot of repeated/hidden metadata in
+    // the H1 subtree. Prefer the actual short heading and clean any metadata
+    // that accidentally got concatenated into it.
+    const rawH1    = $('h1').first().text().replace(/\s+/g, ' ').trim();
+    const ogTitle  = $('meta[property="og:title"]').attr('content') || '';
+    const pageTitle = $('title').text().replace(/\s+/g, ' ').trim();
+
+    let cleanTitle = rawH1 || ogTitle || pageTitle || 'Wohnung zur Miete';
+    // If the selected heading contains the price/metadata block, keep only
+    // the actual property headline before the first euro amount.
+    cleanTitle = cleanTitle.split(/\d[\d.,]*\s*€/)[0].trim();
+    cleanTitle = cleanTitle
+      .replace(/\s*(?:SCHUFA-Bonitätscheck|geschätzte Warmmiete|Kaltmiete|Warmmiete).*$/i, '')
+      .trim();
+    d.title = cleanTitle || 'Wohnung zur Miete';
+
     d.price = extractPrice($('[class*="AdvertPrice"]').text() || $('.price').first().text());
     $('[data-test*="fact"], [class*="FactItem"]').each((_, el) => {
       const lbl = $(el).text().toLowerCase();
       const val = $(el).find('[class*="value"], strong, b').text().trim() || $(el).text().trim();
-      if (/zimmer/.test(lbl))    d.rooms      = extractRooms(lbl) || val;
-      if (/fläche/.test(lbl))    d.size       = extractSize(lbl)  || val;
+      if (/zimmer/.test(lbl))    d.rooms      = extractRooms(lbl) || extractRooms(val) || val;
+      if (/fläche/.test(lbl))    d.size       = extractSize(lbl)  || extractSize(val) || val;
       if (/kaltmiete/.test(lbl)) d.price_cold = extractPrice(val) || val;
     });
-    if (!d.price_cold) d.price_cold = findKaltmiete($, getVisibleText($, 'body').substring(0, 3000));
-    const imgs = collectImages($, ['[class*="Gallery"] img', '[class*="gallery"] img', '[class*="Slider"] img']);
-    d.images_json = JSON.stringify(imgs);
-    d.image_url   = imgs[0] || $('meta[property="og:image"]').attr('content') || '';
+
+    // Address/location appears as a dedicated address block on current
+    // Immowelt exposes. Keep it separate from the noisy title metadata.
+    d.location = $('[data-test*="address"], [data-testid*="address"], [class*="Address"], [class*="address"], [class*="Location"], [class*="location"]')
+      .first().text().replace(/\s+/g, ' ').trim();
+
+    const bodyText = getVisibleText($, 'body').replace(/\s+/g, ' ');
+    if (!d.rooms) d.rooms = extractRooms(bodyText);
+    if (!d.size)  d.size  = extractSize(bodyText);
+
+    if (!d.price_cold) d.price_cold = findKaltmiete($, bodyText.substring(0, 5000));
+    if (!d.price) d.price = extractPrice($('[class*="Warmmiete"], [class*="warmmiete"]').text()) || d.price_cold;
+
+    // Make the title useful in the app without copying Immowelt's complete
+    // metadata string into it.
+    const titleParts = [];
+    if (d.rooms) titleParts.push(d.rooms + ' Zimmer');
+    if (d.size)  titleParts.push(d.size);
+    if (titleParts.length) d.title += ' – ' + titleParts.join(' · ');
+
+    const imgs = collectImages($, [
+      '[class*="Gallery"] img',
+      '[class*="gallery"] img',
+      '[class*="Slider"] img',
+      '[class*="slider"] img',
+      'img[src*="mms.immowelt.de"]',
+      'img[data-src*="mms.immowelt.de"]'
+    ]);
+    const og = $('meta[property="og:image"]').attr('content') || '';
+    if (og && !imgs.includes(og)) imgs.unshift(og);
+    d.images_json = JSON.stringify([...new Set(imgs)]);
+    d.image_url   = imgs[0] || og;
   }
   else if (platform === 'rentola') {
     // Rentola is a Next.js SPA – most content is client-rendered.
