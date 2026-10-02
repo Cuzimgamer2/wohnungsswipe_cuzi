@@ -37,7 +37,7 @@ function clr(...ids)     { ids.forEach(id => { const el = $id(id); if (el) el.te
 
 const THEME_KEY = 'wohnungsswipe-theme';
 function applyTheme(theme) {
-  const allowed = ['standard', 'light', 'dark', 'anti-ai'];
+  const allowed = ['standard', 'light', 'dark', 'anti-ai', 'coastal'];
   const selected = allowed.includes(theme) ? theme : 'standard';
   document.documentElement.dataset.theme = selected;
   localStorage.setItem(THEME_KEY, selected);
@@ -207,7 +207,7 @@ document.addEventListener('click', e => {
 document.querySelectorAll('.theme-option').forEach(btn => {
   btn.addEventListener('click', () => {
     applyTheme(btn.dataset.theme);
-    const labels = {standard:'Standard', light:'Hell', dark:'Dunkel', 'anti-ai':'Anti-AI'};
+    const labels = {standard:'Standard', light:'Hell', dark:'Dunkel', 'anti-ai':'Anti-AI', coastal:'Coastal'};
     toast('🎨 Design: ' + labels[btn.dataset.theme]);
   });
 });
