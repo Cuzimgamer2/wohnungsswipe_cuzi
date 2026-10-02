@@ -18,6 +18,7 @@ Dieser Fork basiert auf **Nicgeon/wohnungsswipe** und enthält zusätzliche Funk
 - Immowelt-Suchergebnisse werden zusätzlich aus eingebettetem Script-/JSON-State erkannt.
 - Immowelt-Galerien werden gezielt aus `gallery.images` ausgelesen.
 - Für jedes Immowelt-Inserat wird die eigentliche Exposé-URL separat aufgerufen.
+- Die Detailseite wird zusätzlich aus dem doppelten `__UFRN_LIFECYCLE_SERVERREQUEST__`-JSON dekodiert; dort liegt die vollständige UFRN-Galerie, die im normalen DOM häufig nicht als `<img>`-Elemente vorhanden ist.
 - Zusätzlich wird die Exposé-URL als Immowelt-Mobile-Webview mit `?app=1` und `aviv_client=ios` geladen und mit dem normalen HTML zusammengeführt.
 - Dieser zusätzliche Detail-Request ist absichtlich langsamer, erhöht aber die Chance auf die vollständige Galerie bei lazy geladenen Bildern deutlich.
 - Immowelt-Bilder werden nicht mehr nur anhand einer Dateiendung erkannt, da CDN-URLs auch ohne sichtbare `.jpg`/`.png`-Endung vorkommen können.
