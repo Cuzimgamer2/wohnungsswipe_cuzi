@@ -79,7 +79,7 @@ function extractListingUrls(html, searchUrl, maxResults = 50) {
     // Current Immowelt pages can also embed result URLs in JSON/script state
     // without rendering them as normal <a> elements.
     const raw = html.replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
-    const re = /https?:\\/\\/(?:www\\.)?immowelt\\.de\\/expose\\/[a-z0-9-]+/gi;
+    const re = /https?:\/\/(?:www\.)?immowelt\.de\/expose\/[a-z0-9-]+/gi;
     let m;
     while ((m = re.exec(raw))) urls.add(m[0].replace(/\\/g, '').split('?')[0]);
   } else if (platform === 'rentola') {
