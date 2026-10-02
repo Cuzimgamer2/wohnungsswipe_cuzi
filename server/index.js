@@ -675,6 +675,8 @@ app.post('/api/search/scrape', requireAuth, async (req, res) => {
     res.json({
       success: true,
       found: result.urls.length,
+      successful: result.successful ?? result.listings.length,
+      failed: result.failed || [],
       added: added.length,
       updated: updatedCount,
       listings: added,
