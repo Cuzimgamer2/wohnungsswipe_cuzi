@@ -1370,7 +1370,7 @@ function updateRatedBulkButtons() {
   const select = $id('rated-select-all-btn');
   if (del) {
     del.disabled = count === 0;
-    del.textContent = count ? (\'🗑 \' + count + \' bewertete Inserate löschen\') : '🗑 Bewertete Inserate löschen';
+    del.textContent = count ? ('🗑 ' + count + ' bewertete Inserate löschen') : '🗑 Bewertete Inserate löschen';
   }
   if (select) {
     const filter = state.ratedFilter;
