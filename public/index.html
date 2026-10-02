@@ -80,16 +80,82 @@
       <div class="profile-menu-wrap">
         <button id="profile-menu-btn" class="profile-menu-btn" type="button" aria-expanded="false">
           <span id="nav-username" class="nav-user"></span>
-          <span class="profile-menu-chevron">⌄</span>
+          <span class="profile-menu-chevron" aria-hidden="true"></span>
         </button>
         <div id="profile-menu" class="profile-menu" style="display:none">
           <button type="button" class="profile-menu-item" data-profile-goto="settings">⚙️ Profil</button>
           <div class="profile-menu-divider"></div>
           <div class="profile-menu-label">Design</div>
-          <button type="button" class="profile-menu-item theme-option" data-theme="standard">◐ Standard</button>
-          <button type="button" class="profile-menu-item theme-option" data-theme="light">☀️ Hell</button>
-          <button type="button" class="profile-menu-item theme-option" data-theme="dark">◑ Dunkel</button>
-          <button type="button" class="profile-menu-item theme-option" data-theme="anti-ai">▦ Anti-AI</button>
+          <div class="theme-option-wrap">
+            <button type="button" class="profile-menu-item theme-option" data-theme="standard">
+              <span class="theme-option-icon">◐</span><span>Standard</span><span class="theme-option-check">✓</span>
+            </button>
+            <div class="theme-preview" data-preview-theme="standard" aria-hidden="true">
+              <div class="theme-preview-window">
+                <div class="tp-nav"><span class="tp-brand">WohnungsSwipe</span><span class="tp-user"></span></div>
+                <div class="tp-tabs"><span>Swipen</span><span>Bewertet</span><span>Gruppen</span></div>
+                <div class="tp-content">
+                  <div class="tp-card"><div class="tp-photo"></div><div class="tp-lines"><b></b><i></i><i></i><div class="tp-actions"><em></em><em></em><em></em></div></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="theme-option-wrap">
+            <button type="button" class="profile-menu-item theme-option" data-theme="light">
+              <span class="theme-option-icon">☀</span><span>Hell</span><span class="theme-option-check">✓</span>
+            </button>
+            <div class="theme-preview" data-preview-theme="light" aria-hidden="true">
+              <div class="theme-preview-window">
+                <div class="tp-nav"><span class="tp-brand">WohnungsSwipe</span><span class="tp-user"></span></div>
+                <div class="tp-tabs"><span>Swipen</span><span>Bewertet</span><span>Gruppen</span></div>
+                <div class="tp-content">
+                  <div class="tp-card"><div class="tp-photo"></div><div class="tp-lines"><b></b><i></i><i></i><div class="tp-actions"><em></em><em></em><em></em></div></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="theme-option-wrap">
+            <button type="button" class="profile-menu-item theme-option" data-theme="dark">
+              <span class="theme-option-icon">◑</span><span>Dunkel</span><span class="theme-option-check">✓</span>
+            </button>
+            <div class="theme-preview" data-preview-theme="dark" aria-hidden="true">
+              <div class="theme-preview-window">
+                <div class="tp-nav"><span class="tp-brand">WohnungsSwipe</span><span class="tp-user"></span></div>
+                <div class="tp-tabs"><span>Swipen</span><span>Bewertet</span><span>Gruppen</span></div>
+                <div class="tp-content">
+                  <div class="tp-card"><div class="tp-photo"></div><div class="tp-lines"><b></b><i></i><i></i><div class="tp-actions"><em></em><em></em><em></em></div></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="theme-option-wrap">
+            <button type="button" class="profile-menu-item theme-option" data-theme="anti-ai">
+              <span class="theme-option-icon">▦</span><span>Anti-AI</span><span class="theme-option-check">✓</span>
+            </button>
+            <div class="theme-preview" data-preview-theme="anti-ai" aria-hidden="true">
+              <div class="theme-preview-window">
+                <div class="tp-nav"><span class="tp-brand">WohnungsSwipe</span><span class="tp-user"></span></div>
+                <div class="tp-tabs"><span>Swipen</span><span>Bewertet</span><span>Gruppen</span></div>
+                <div class="tp-content">
+                  <div class="tp-card"><div class="tp-photo"></div><div class="tp-lines"><b></b><i></i><i></i><div class="tp-actions"><em></em><em></em><em></em></div></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="theme-option-wrap">
+            <button type="button" class="profile-menu-item theme-option" data-theme="coastal">
+              <span class="theme-option-icon">◒</span><span>Coastal</span><span class="theme-option-check">✓</span>
+            </button>
+            <div class="theme-preview" data-preview-theme="coastal" aria-hidden="true">
+              <div class="theme-preview-window">
+                <div class="tp-nav"><span class="tp-brand">WohnungsSwipe</span><span class="tp-user"></span></div>
+                <div class="tp-tabs"><span>Swipen</span><span>Bewertet</span><span>Gruppen</span></div>
+                <div class="tp-content">
+                  <div class="tp-card"><div class="tp-photo"></div><div class="tp-lines"><b></b><i></i><i></i><div class="tp-actions"><em></em><em></em><em></em></div></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
           <div class="profile-menu-divider"></div>
           <button id="logout-btn" type="button" class="profile-menu-item profile-menu-logout">↪ Logout</button>
         </div>
