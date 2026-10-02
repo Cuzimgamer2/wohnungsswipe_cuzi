@@ -8,6 +8,7 @@ const state = {
   swipeQueue: [],
   ratedFilter: 'all',
   lastSwipe:  null, // { listing, action } – powers the "Sofort-Undo" button
+  ratedSelected: new Set(),
 };
 
 // ── Helpers ───────────────────────────────────────────────
@@ -33,6 +34,18 @@ function toast(msg, ms = 2800) {
 function setErr(id, msg) { const el = $id(id); if (el) el.textContent = msg; }
 function setOk(id, msg)  { const el = $id(id); if (el) el.textContent = msg; }
 function clr(...ids)     { ids.forEach(id => { const el = $id(id); if (el) el.textContent = ''; }); }
+
+const THEME_KEY = 'wohnungsswipe-theme';
+function applyTheme(theme) {
+  const allowed = ['standard', 'light', 'dark', 'anti-ai'];
+  const selected = allowed.includes(theme) ? theme : 'standard';
+  document.documentElement.dataset.theme = selected;
+  localStorage.setItem(THEME_KEY, selected);
+  document.querySelectorAll('.theme-option').forEach(btn => {
+    btn.classList.toggle('selected', btn.dataset.theme === selected);
+  });
+}
+applyTheme(localStorage.getItem(THEME_KEY) || 'standard');
 
 function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -153,6 +166,7 @@ $id('forgot-submit').addEventListener('click', async () => {
 function onLogin(data) {
   state.user = data;
   $id('nav-username').textContent = data.username;
+  applyTheme(localStorage.getItem(THEME_KEY) || 'standard');
   showScreen('app-screen');
   loadGroups().then(() => loadSwipeQueue());
   openSharedListingFromUrl();
@@ -169,6 +183,40 @@ async function doLogout() {
 }
 $id('logout-btn').addEventListener('click', doLogout);
 $id('settings-logout-btn').addEventListener('click', doLogout);
+
+$id('profile-menu-btn').addEventListener('click', e => {
+  e.stopPropagation();
+  const menu = $id('profile-menu');
+  const open = menu.style.display !== 'none';
+  closeProfileMenu();
+  if (!open) {
+    menu.style.display = 'flex';
+    $id('profile-menu-btn').setAttribute('aria-expanded', 'true');
+  }
+});
+
+function closeProfileMenu() {
+  const menu = $id('profile-menu');
+  if (!menu) return;
+  menu.style.display = 'none';
+  $id('profile-menu-btn')?.setAttribute('aria-expanded', 'false');
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.profile-menu-wrap')) closeProfileMenu();
+});
+document.querySelectorAll('.theme-option').forEach(btn => {
+  btn.addEventListener('click', () => {
+    applyTheme(btn.dataset.theme);
+    const labels = {standard:'Standard', light:'Hell', dark:'Dunkel', 'anti-ai':'Anti-AI'};
+    toast('🎨 Design: ' + labels[btn.dataset.theme]);
+  });
+});
+document.querySelectorAll('[data-profile-goto="settings"]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    closeProfileMenu();
+    showView('settings', true);
+  });
+});
 
 // ══════════════════════════════════════════════════════════
 //  LIGHTBOX
@@ -596,9 +644,10 @@ function buildListCard(listing, opts = {}) {
   const visLabel = { global:'🌐 Alle', private:'🔒 Nur ich', group:'👥 Gruppe' }[listing.visibility || 'global'];
 
   const div = document.createElement('div');
-  div.className = 'list-card';
+  div.className = 'list-card' + (opts.selectable ? ' list-card-selectable' : '');
 
   div.innerHTML = `
+    ${opts.selectable ? '<label class="rated-select-wrap" title="Inserat auswählen"><input type="checkbox" class="rated-select" data-listing-id="' + listing.id + '" ' + (state.ratedSelected.has(Number(listing.id)) ? 'checked' : '') + '><span></span></label>' : ''}
     <div class="list-card-img-area">
       ${hasImg
         ? `<img class="list-card-img" src="${esc(images[0])}" onerror="this.style.display='none'" />`
@@ -650,6 +699,17 @@ function buildListCard(listing, opts = {}) {
         </div>
       </div>
     </div>`;
+
+  if (opts.selectable) {
+    const cb = div.querySelector('.rated-select');
+    cb?.addEventListener('click', e => e.stopPropagation());
+    cb?.addEventListener('change', () => {
+      const id = Number(cb.dataset.listingId);
+      if (cb.checked) state.ratedSelected.add(id);
+      else state.ratedSelected.delete(id);
+      updateRatedBulkButtons();
+    });
+  }
 
   if (hasImg) div.querySelector('.list-card-img-area').addEventListener('click', e => {
     if (e.target.closest('[data-menu-toggle]') || e.target.closest('[data-menu]')) return;
@@ -1300,7 +1360,24 @@ let _ratedAll = [];
 async function loadRated() {
   const d = await api('/api/listings/rated');
   _ratedAll = d.listings || [];
+  state.ratedSelected.clear();
   renderRated();
+}
+
+function updateRatedBulkButtons() {
+  const count = state.ratedSelected.size;
+  const del = $id('rated-delete-selected-btn');
+  const select = $id('rated-select-all-btn');
+  if (del) {
+    del.disabled = count === 0;
+    del.textContent = count ? (\'🗑 \' + count + \' bewertete Inserate löschen\') : '🗑 Bewertete Inserate löschen';
+  }
+  if (select) {
+    const filter = state.ratedFilter;
+    const visible = filter === 'all' ? _ratedAll : _ratedAll.filter(l => l.my_swipe === filter);
+    const allSelected = visible.length > 0 && visible.every(l => state.ratedSelected.has(Number(l.id)));
+    select.textContent = allSelected ? 'Auswahl aufheben' : 'Alle auswählen';
+  }
 }
 
 function renderRated() {
@@ -1309,15 +1386,44 @@ function renderRated() {
   const filter = state.ratedFilter;
   const items  = filter === 'all' ? _ratedAll : _ratedAll.filter(l => l.my_swipe === filter);
   list.innerHTML = '';
-  if (!items.length) { empty.style.display = ''; return; }
+  if (!items.length) {
+    empty.style.display = '';
+    updateRatedBulkButtons();
+    return;
+  }
   empty.style.display = 'none';
-  items.forEach(l => list.appendChild(buildListCard(l)));
+  items.forEach(l => list.appendChild(buildListCard(l, { selectable: true })));
+  updateRatedBulkButtons();
 }
+
+$id('rated-select-all-btn').addEventListener('click', () => {
+  const filter = state.ratedFilter;
+  const visible = filter === 'all' ? _ratedAll : _ratedAll.filter(l => l.my_swipe === filter);
+  const allSelected = visible.length > 0 && visible.every(l => state.ratedSelected.has(Number(l.id)));
+  visible.forEach(l => {
+    const id = Number(l.id);
+    if (allSelected) state.ratedSelected.delete(id);
+    else state.ratedSelected.add(id);
+  });
+  renderRated();
+});
+
+$id('rated-delete-selected-btn').addEventListener('click', async () => {
+  const ids = [...state.ratedSelected];
+  if (!ids.length) return;
+  if (!confirm('Wirklich ' + ids.length + ' bewertete Inserate aus deinen Bewertungen entfernen? Die Inserate selbst bleiben für andere Nutzer erhalten.')) return;
+
+  const r = await api('/api/listings/rated', { method: 'DELETE', body: { listingIds: ids }});
+  if (!r.success) return toast('❌ ' + (r.error || 'Löschen fehlgeschlagen'));
+  state.ratedSelected.clear();
+  toast('🗑 ' + (r.deleted || ids.length) + ' Bewertungen entfernt');
+  await loadRated();
+});
 
 document.getElementById('rated-filter').addEventListener('click', e => {
   const btn = e.target.closest('.filter-btn');
   if (!btn) return;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('#rated-filter .filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   state.ratedFilter = btn.dataset.filter;
   renderRated();
@@ -2252,6 +2358,7 @@ async function openSharedListingFromUrl() {
   if (me.loggedIn) {
     state.user = { userId: me.id, username: me.username };
     $id('nav-username').textContent = me.username;
+    applyTheme(localStorage.getItem(THEME_KEY) || 'standard');
     showScreen('app-screen');
     await loadGroups();
     loadSwipeQueue();
