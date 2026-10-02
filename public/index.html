@@ -77,8 +77,23 @@
   <nav class="app-nav">
     <div class="nav-logo">🏠 <span>WohnungsSwipe</span></div>
     <div class="nav-actions">
-      <span id="nav-username" class="nav-user"></span>
-      <button id="logout-btn" class="btn-ghost">Logout</button>
+      <div class="profile-menu-wrap">
+        <button id="profile-menu-btn" class="profile-menu-btn" type="button" aria-expanded="false">
+          <span id="nav-username" class="nav-user"></span>
+          <span class="profile-menu-chevron">⌄</span>
+        </button>
+        <div id="profile-menu" class="profile-menu" style="display:none">
+          <button type="button" class="profile-menu-item" data-profile-goto="settings">⚙️ Profil</button>
+          <div class="profile-menu-divider"></div>
+          <div class="profile-menu-label">Design</div>
+          <button type="button" class="profile-menu-item theme-option" data-theme="standard">◐ Standard</button>
+          <button type="button" class="profile-menu-item theme-option" data-theme="light">☀️ Hell</button>
+          <button type="button" class="profile-menu-item theme-option" data-theme="dark">◑ Dunkel</button>
+          <button type="button" class="profile-menu-item theme-option" data-theme="anti-ai">▦ Anti-AI</button>
+          <div class="profile-menu-divider"></div>
+          <button id="logout-btn" type="button" class="profile-menu-item profile-menu-logout">↪ Logout</button>
+        </div>
+      </div>
     </div>
   </nav>
 
@@ -172,7 +187,13 @@
   <div id="view-rated" class="view">
     <div class="view-content">
       <div class="rated-header">
-        <h2 class="view-title">Meine Bewertungen</h2>
+        <div>
+          <h2 class="view-title">Meine Bewertungen</h2>
+          <div class="rated-bulk-actions">
+            <button class="btn-ghost compact" id="rated-select-all-btn" type="button">Alle auswählen</button>
+            <button class="btn-danger compact" id="rated-delete-selected-btn" type="button" disabled>🗑 Bewertete Inserate löschen</button>
+          </div>
+        </div>
         <div class="rated-filter" id="rated-filter">
           <button class="filter-btn active" data-filter="all">Alle</button>
           <button class="filter-btn" data-filter="like">♥ Likes</button>
@@ -304,11 +325,11 @@
       <div class="card-form hint-card">
         <p class="section-label">So bekommst du eine Such-URL</p>
         <div class="hint-list">
-          <div class="hint-item"><strong>Kleinanzeigen</strong> – Suche filtern (Ort, Preis, Zimmer) → URL aus der Adressleiste kopieren.</div>
-          <div class="hint-item"><strong>ImmobilienScout24</strong> – Suchergebnisse filtern → URL kopieren.</div>
-          <div class="hint-item"><strong>Immowelt</strong> – Suchergebnisse filtern → URL kopieren.</div>
-          <div class="hint-item"><strong>rentola</strong> – Suchergebnisse filtern → URL kopieren.</div>
-          <div class="hint-item"><strong>meinestadt</strong> – Suchergebnisse filtern → URL kopieren.</div>
+          <a class="hint-item hint-link" href="https://www.kleinanzeigen.de/" target="_blank" rel="noopener"><strong>Kleinanzeigen</strong><span>Suche filtern → Such-URL aus der Adressleiste kopieren ↗</span></a>
+          <a class="hint-item hint-link" href="https://www.immobilienscout24.de/" target="_blank" rel="noopener"><strong>ImmobilienScout24</strong><span>Suchergebnisse filtern → URL kopieren ↗</span></a>
+          <a class="hint-item hint-link" href="https://www.immowelt.de/" target="_blank" rel="noopener"><strong>Immowelt</strong><span>Suchergebnisse filtern → URL kopieren ↗</span></a>
+          <a class="hint-item hint-link" href="https://rentola.de/" target="_blank" rel="noopener"><strong>rentola</strong><span>Suchergebnisse filtern → URL kopieren ↗</span></a>
+          <a class="hint-item hint-link" href="https://www.meinestadt.de/" target="_blank" rel="noopener"><strong>meinestadt</strong><span>Suchergebnisse filtern → URL kopieren ↗</span></a>
         </div>
       </div>
 
