@@ -51,7 +51,7 @@ async function fetchPageRaw(url, timeoutMs = 18000, allowedFailCodes = []) {
 }
 
 // ── Extract listing URLs from search results page ──────────
-function extractListingUrls(html, searchUrl) {
+function extractListingUrls(html, searchUrl, maxResults = 50) {
   const $        = cheerio.load(html);
   const platform = detectPlatform(searchUrl);
   const urls     = new Set();
@@ -94,7 +94,7 @@ function extractListingUrls(html, searchUrl) {
     });
   }
 
-  return [...urls].slice(0, 50);
+  return [...urls].slice(0, maxResults);
 }
 
 // ── Extract price helpers ──────────────────────────────────
@@ -202,13 +202,30 @@ function extractKleinanzeigenAusstattung($) {
 
 function collectImages($, selectors) {
   const set = new Set();
+
   selectors.forEach(sel => {
     $(sel).each((_, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || $(el).attr('content') || '';
-      if (src.startsWith('http') && /\.(jpe?g|png|webp)/i.test(src) && !/logo|icon|avatar/i.test(src))
+      const candidates = [
+        $(el).attr('src'),
+        $(el).attr('data-src'),
+        $(el).attr('data-lazy-src'),
+        $(el).attr('data-imgsrc'),
+        $(el).attr('content'),
+        ...((($(el).attr('srcset') || $(el).attr('data-srcset') || '').split(','))
+          .map(x => x.trim().split(/\s+/)[0])
+          .filter(Boolean))
+      ].filter(Boolean);
+
+      for (const src of candidates) {
+        if (!src.startsWith('http')) continue;
+        if (/logo|icon|avatar|favicon/i.test(src)) continue;
+        // Gallery/CDN URLs frequently have no file extension (especially
+        // Immowelt). Trust the selector and keep those URLs as well.
         set.add(src);
+      }
     });
   });
+
   return [...set];
 }
 
@@ -840,6 +857,33 @@ async function checkExistingListings(listings, onStatusChange, onFieldChange) {
   return results;
 }
 
+// ── One-shot search scraper ───────────────────────────────
+// Fetch a public search-results URL and scrape only the first N listing URLs.
+// This is intentionally separate from a recurring search job.
+async function scrapeSearchResults(searchUrl, limit = 10) {
+  const searchHtml = await fetchPage(searchUrl, 20000);
+  const urls = extractListingUrls(searchHtml, searchUrl, Math.max(1, Math.min(50, limit)));
+
+  if (!urls.length) {
+    const lc = searchHtml.toLowerCase();
+    if (lc.includes('captcha') || lc.includes('robot'))
+      throw new Error('CAPTCHA erkannt – bitte die Suche manuell öffnen');
+    throw new Error(`Keine Inserat-Links gefunden (${searchHtml.length} Bytes) – Seitenstruktur evtl. geändert`);
+  }
+
+  const listings = [];
+  for (const url of urls) {
+    try {
+      listings.push(await scrapeListing(url));
+      await sleep(1200 + Math.random() * 1000);
+    } catch (e) {
+      console.warn(`[Search] Fehler beim Scrapen von ${url}: ${e.message}`);
+    }
+  }
+
+  return { urls, listings };
+}
+
 // ── Main export – poll one search job ─────────────────────
 async function pollSearchJob(job, exists, insert) {
   let searchHtml;
@@ -869,4 +913,4 @@ async function pollSearchJob(job, exists, insert) {
   return { newCount, totalFound: urls.length };
 }
 
-module.exports = { pollSearchJob, checkExistingListings, detectPlatform, scrapeListing };
+module.exports = { pollSearchJob, checkExistingListings, detectPlatform, scrapeListing, scrapeSearchResults };
