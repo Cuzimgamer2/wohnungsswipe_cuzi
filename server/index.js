@@ -914,6 +914,22 @@ app.delete('/api/listings/swipe/:id', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+app.delete('/api/listings/rated', requireAuth, (req, res) => {
+  const ids = Array.isArray(req.body?.listingIds)
+    ? [...new Set(req.body.listingIds.map(Number).filter(Number.isInteger))]
+    : [];
+
+  if (!ids.length) return res.status(400).json({ error: 'Keine Inserate ausgewählt' });
+
+  const ph = ids.map(() => '?').join(',');
+  dbRun(
+    `DELETE FROM swipes WHERE user_id=? AND listing_id IN (${ph})`,
+    [req.session.userId, ...ids]
+  );
+  saveDb();
+  res.json({ success: true, deleted: ids.length });
+});
+
 // User-reported offline: lets anyone flag a listing they notice is dead
 // (expired, rented, deleted on the source site) without waiting for the
 // 6-hour auto status check. Marks it offline + archives it immediately,
