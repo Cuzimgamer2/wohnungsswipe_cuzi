@@ -8,7 +8,7 @@ const fs         = require('fs');
 const crypto     = require('crypto');
 const MemoryStore = require('memorystore')(session);
 const webpush    = require('web-push');
-const { pollSearchJob, checkExistingListings, detectPlatform, scrapeListing } = require('./poller');
+const { pollSearchJob, checkExistingListings, detectPlatform, scrapeListing, scrapeSearchResults } = require('./poller');
 const mailer     = require('./mailer');
 
 const app  = express();
@@ -623,6 +623,40 @@ app.post('/api/listings/add', requireAuth, async (req, res) => {
   }
   saveDb();
   res.json({ success: true, listing });
+});
+
+// One-shot import: scrape the first 10 results from a public search URL.
+// Unlike a search agent this does not create a recurring job.
+app.post('/api/search/scrape', requireAuth, async (req, res) => {
+  const { url, limit } = req.body || {};
+  if (!url || !/^https?:\/\//i.test(url))
+    return res.status(400).json({ error: 'Gültige Such-URL erforderlich' });
+
+  const max = Math.max(1, Math.min(10, parseInt(limit) || 10));
+
+  try {
+    const result = await scrapeSearchResults(url, max);
+    const added = [];
+
+    for (const data of result.listings) {
+      const inserted = insertListing(data, req.session.userId, null, 'global', null);
+      if (inserted.isNew) {
+        const listing = dbGet('SELECT * FROM listings WHERE id=?', [inserted.id]);
+        if (listing) added.push(listing);
+      }
+    }
+
+    saveDb();
+    res.json({
+      success: true,
+      found: result.urls.length,
+      added: added.length,
+      listings: added,
+    });
+  } catch (e) {
+    console.error('[Search] One-shot Fehler:', e.message);
+    res.status(502).json({ error: e.message || 'Suche konnte nicht geladen werden' });
+  }
 });
 
 // Listings found by a specific search agent
